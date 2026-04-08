@@ -1,0 +1,22 @@
+[project]
+name = "adaptive-executor"
+version = "0.1.0"
+description = "Resource-aware parallel executor that learns from usage patterns to autoscale workers"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "nvidia-ml-py>=13.595.45",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["adaptive_executor*"]
