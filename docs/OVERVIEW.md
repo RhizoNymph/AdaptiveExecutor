@@ -110,8 +110,9 @@ Features Index:
       Reservation-based EASY backfill: when the head of the queue is blocked,
       later tasks may be dispatched ahead of it only when they cannot delay the
       head's resource reservation. Preserves the "never later than FIFO"
-      invariant and per-GPU VRAM accounting; an exclusive head blocks all
-      backfill.
+      invariant and per-GPU VRAM accounting. Exclusive tasks run alone start to
+      finish: an exclusive head blocks all backfill, and a running exclusive
+      task blocks all dispatch until it leaves the in-flight set.
     entry_points:
       - adaptive_executor.scheduling.plan_dispatch
       - adaptive_executor.AdaptiveExecutor._build_dispatch_plan

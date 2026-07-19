@@ -363,6 +363,7 @@ class AdaptiveExecutor:
                 vram_gb=p.estimate.vram_gb,
                 gpu_id=p.assigned_gpu_id,
                 remaining_seconds=self._running_remaining_seconds(p, now),
+                exclusive=p.exclusive,
             )
             for p in self.in_flight.values()
         ]

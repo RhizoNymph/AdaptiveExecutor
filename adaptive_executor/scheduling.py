@@ -25,6 +25,17 @@ cannot be admitted now, we do NOT simply stall the whole queue. Instead:
 
 Invariant: the head never starts later than it would under strict FIFO.
 
+Exclusive tasks run alone, start to finish. An exclusive task is one that must
+have the machine to itself for its whole run (e.g. the OOM-crash retry path
+penalizes an estimate and marks the task exclusive). This is enforced at both
+ends of the task's life:
+
+* While an exclusive task is *in flight* (present in ``running``),
+  :func:`plan_dispatch` returns an empty plan — nothing else is dispatched
+  until it leaves the running set (completes, fails, or crashes).
+* While an exclusive task is the blocked *head*, it admits no backfill (it needs
+  the in-flight set to drain to empty, and admitting anything would delay that).
+
 Conservative fallbacks
 ----------------------
 * Unknown duration (``duration_p90_seconds is None``) is treated as INFINITE. A
@@ -40,6 +51,8 @@ Conservative fallbacks
 * An exclusive head (needs an empty in-flight set) reserves the entire drain of
   every running task; admitting anything would delay that drain, so an exclusive
   head blocks all backfill.
+* An exclusive task that is already *running* blocks the whole cycle: no task is
+  dispatched alongside it, so it keeps the machine to itself until it finishes.
 """
 
 import math
@@ -80,6 +93,9 @@ class RunningEntry:
     # Expected seconds until this task releases its resources. None => unknown
     # (assumed to never release: overran its estimate or has no history).
     remaining_seconds: float | None
+    # An exclusive in-flight task must run alone: while it is running, no other
+    # task may be dispatched this cycle (see :meth:`_Planner.run`).
+    exclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -154,6 +170,14 @@ class _Planner:
         self.decisions: list[DispatchDecision] = []
 
     def run(self) -> DispatchPlan:
+        # 0. An exclusive task already in flight owns the whole machine for its
+        #    entire run: while it is running, nothing else may be dispatched.
+        #    Exclusivity ends naturally when it leaves the running set. (At this
+        #    point occupants == the passed-in running set, since nothing has
+        #    been admitted yet.)
+        if any(o.exclusive for o in self.occupants):
+            return self._plan()
+
         # 1. Greedily admit front tasks that fit now (strict FIFO behavior).
         while self.queue:
             head = self.queue[0]
