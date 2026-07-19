@@ -11,7 +11,9 @@
   reason about when running tasks release resources and whether a backfill task
   finishes in time.
 - Per-GPU VRAM accounting for reservations and backfill placement.
-- Correct interaction with exclusive tasks (`PendingWork.exclusive`).
+- Correct interaction with exclusive tasks (`PendingWork.exclusive`): an
+  exclusive task runs alone for its entire run — as a blocked head it admits no
+  backfill, and once in flight it blocks all dispatch until it finishes.
 
 ## Non-scope
 - Worker-pool lifecycle, GPU pinning, timeouts, crash retry, persistence — all
@@ -49,6 +51,8 @@
      - `RunningEntry.remaining_seconds` = `_running_remaining_seconds(pending)` —
        `duration_p90 - elapsed`, or `None` if duration unknown, not started, or
        the task has **overrun** its estimate (elapsed >= p90).
+     - `RunningEntry.exclusive` = `pending.exclusive` — whether this in-flight
+       task must run alone (used to gate the whole cycle; see below).
      - `PendingEntry` carries memory/VRAM/CPU/`duration_p90_seconds`/`exclusive`.
    - `plan_dispatch(pending, running, capacity)` returns a `DispatchPlan`
      (ordered `DispatchDecision(pending_id, gpu_id)` + updated `next_gpu_index`).
@@ -57,6 +61,9 @@
      `in_flight` and sends the `WorkItem`. Dispatched ids are removed from
      `self.pending` (which may become non-contiguous).
 3. **plan_dispatch / `_Planner`** (pure):
+   0. If **any running entry is exclusive**, return an empty plan immediately —
+      an exclusive task in flight owns the whole machine until it leaves the
+      running set, so nothing else may be dispatched this cycle.
    1. Greedily admit front tasks that fit now, in FIFO order (identical to strict
       FIFO). Each front admit consumes the live pools and becomes an occupant
       that starts now (remaining = its own p90 duration).
@@ -90,6 +97,11 @@
 - **Exclusive head ⇒ no backfill.** An exclusive head requires the in-flight set
   to drain to empty; admitting anything would extend that drain, so an exclusive
   head blocks all backfill.
+- **Exclusive task running ⇒ no dispatch at all.** Once an exclusive task is in
+  flight, the scheduler returns an empty plan every cycle until it leaves the
+  running set, so it runs alone start to finish (not just at its start). This is
+  the OOM-retry case: a task killed under memory pressure is penalized and
+  marked exclusive, and must keep the machine to itself for its whole retry.
 - **No snapshot ⇒ memory/VRAM non-gating.** Before the first monitor snapshot,
   memory and VRAM are treated as infinite, matching prior startup admission.
 
@@ -106,6 +118,11 @@
 - `adaptive_executor/profiles.py` — `LearnedProfile.estimate()` computes the p90
   duration.
 - `tests/test_scheduling.py` — pure unit tests (all scenarios).
+- `tests/test_scheduling_exclusive.py` — pure unit tests for exclusive *run*
+  isolation (a running exclusive task blocks all dispatch; exclusivity lifts
+  when it leaves the running set).
+- `tests/sim/test_exclusive_isolation.py` — sim property test: in an OOM-retry
+  storm, no dispatch overlaps an exclusive task's run window.
 - `tests/test_backfill_integration.py` — integration tests through the real
   executor dispatch path with fake spawning and an injected snapshot.
 
@@ -117,6 +134,10 @@
   a). In both cases the head's earliest feasible start is unchanged.
 - **Per-GPU safety.** A backfill task never consumes VRAM on the GPU the head is
   reserving unless it finishes before the reservation.
+- **Exclusive runs alone, start to finish.** An exclusive task never shares the
+  machine once it is in flight: as a blocked head it admits no backfill, and
+  while running it forces an empty plan every cycle, so no other task is
+  dispatched until it leaves the running set (completes/fails/crashes).
 - **Purity/determinism.** `plan_dispatch` is a pure function of its inputs — no
   threads, no clock reads, no I/O — so it is exhaustively unit-testable. The
   executor performs all time reads and state capture before calling it.

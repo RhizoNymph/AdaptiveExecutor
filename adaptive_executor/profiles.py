@@ -13,6 +13,30 @@ from .dtypes import ResourceEstimate, ResourceObservation
 
 logger = logging.getLogger("adaptive_executor.profiles")
 
+# Separator between the base function key (``module:qualname``) and an optional
+# caller-supplied ``profile_key``. User keys are opaque strings; escaping is not
+# required. The convention is that the base key never contains this separator, so
+# ``module:qualname#profile_key`` cannot collide with a plain ``module:qualname``
+# key. Callers who want disjoint buckets should keep their keys free of ``#``
+# themselves (two keys that differ only around a ``#`` are their responsibility).
+STORE_KEY_SEPARATOR = "#"
+
+
+def derive_store_key(
+    fn_module: str, fn_name: str, profile_key: str | None = None
+) -> str:
+    """Return the ProfileStore key for a function, optionally input-bucketed.
+
+    This is the single place store keys are derived. Without a ``profile_key`` the
+    key is the base ``module:qualname``; with one it is
+    ``module:qualname#profile_key``. The base profile always lives at the
+    separator-free key and remains the aggregate fallback.
+    """
+    base = f"{fn_module}:{fn_name}"
+    if profile_key is None:
+        return base
+    return f"{base}{STORE_KEY_SEPARATOR}{profile_key}"
+
 
 @dataclass
 class LearnedProfile:
@@ -110,23 +134,62 @@ class ProfileStore:
             self._load()
 
     def fn_key(self, fn_module: str, fn_name: str) -> str:
-        return f"{fn_module}:{fn_name}"
+        return derive_store_key(fn_module, fn_name)
 
-    def get(self, fn_module: str, fn_name: str) -> LearnedProfile:
+    def _select_profile_locked(
+        self, fn_module: str, fn_name: str, profile_key: str | None
+    ) -> LearnedProfile:
+        """Pick the profile to estimate from. Must hold ``self.lock``.
+
+        When a ``profile_key`` is given, the input-bucketed profile is used only
+        if it already has at least one observation; otherwise estimation falls
+        back to the aggregate base profile (and its confidence/safety machinery).
+        Reads the keyed entry via ``dict.get`` so an empty bucket is never
+        materialized on the fallback path.
+        """
+        if profile_key is not None:
+            keyed = self.profiles.get(
+                derive_store_key(fn_module, fn_name, profile_key)
+            )
+            if keyed is not None and keyed.observations:
+                return keyed
+        return self.profiles[derive_store_key(fn_module, fn_name)]
+
+    def get(
+        self, fn_module: str, fn_name: str, profile_key: str | None = None
+    ) -> LearnedProfile:
         """Return a snapshot copy of the profile for estimation purposes.
 
-        Returns a copy to avoid race conditions when reading observations.
+        Returns a copy to avoid race conditions when reading observations. With a
+        ``profile_key`` the input-bucketed profile is preferred when it has any
+        observations, else the base profile is used (see
+        ``_select_profile_locked``).
         """
         with self.lock:
-            profile = self.profiles[self.fn_key(fn_module, fn_name)]
+            profile = self._select_profile_locked(fn_module, fn_name, profile_key)
             copy = LearnedProfile(max_observations=profile.max_observations)
             copy.observations = list(profile.observations)  # shallow copy of list
             return copy
 
-    def record(self, fn_module: str, fn_name: str, observation: ResourceObservation):
+    def record(
+        self,
+        fn_module: str,
+        fn_name: str,
+        observation: ResourceObservation,
+        profile_key: str | None = None,
+    ):
+        """Record one observation into the base profile and, when a
+        ``profile_key`` is supplied, additionally into the input-bucketed
+        profile. The base profile always accumulates every observation so it
+        remains the aggregate fallback.
+        """
         snapshot: dict[str, list[dict]] | None = None
         with self.lock:
-            self.profiles[self.fn_key(fn_module, fn_name)].add(observation)
+            self.profiles[derive_store_key(fn_module, fn_name)].add(observation)
+            if profile_key is not None:
+                self.profiles[
+                    derive_store_key(fn_module, fn_name, profile_key)
+                ].add(observation)
             self._pending_since_save += 1
             if self._should_save_locked():
                 snapshot = self._snapshot_locked()

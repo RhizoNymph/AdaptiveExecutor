@@ -145,6 +145,55 @@ future = executor.submit(
 
 For first-run GPU workloads, a nonzero `vram_gb` hint is important if the function has no learned profile yet. Otherwise the executor may initially treat the task as CPU-only until it has observed a GPU-backed run.
 
+## Input-aware profiles
+
+Profiles are learned per function. But some functions use wildly different
+amounts of memory depending on their **input** — `process(small_file)` versus
+`process(huge_file)`. Merged into one profile, the p90 estimate either OOMs on
+the big inputs or needlessly throttles the small ones.
+
+Pass an optional `profile_key` — an opaque string you choose — to bucket inputs
+that behave alike. Each bucket learns its own distribution, so estimation and
+admission control adapt to the input at hand:
+
+```python
+def bucket_for(path: str) -> str:
+    size_gb = os.path.getsize(path) / 1e9
+    if size_gb < 1:
+        return "small"
+    if size_gb < 10:
+        return "medium"
+    return "large"
+
+with AdaptiveExecutor(profile_path="profiles.json") as executor:
+    futures = [
+        executor.submit(process, path, profile_key=bucket_for(path))
+        for path in paths
+    ]
+    results = [f.result() for f in futures]
+```
+
+Semantics:
+
+- **Storage.** A keyed profile is stored under a derived key
+  `module:qualname#profile_key`; the base profile stays at `module:qualname`.
+  Keys are opaque strings and are not escaped — the only convention is that a
+  base key never contains `#`, so a keyed entry can never collide with a base
+  entry.
+- **Recording.** Every observation is recorded into **both** the keyed profile
+  (when a key was given) and the base profile, so the base remains an aggregate
+  fallback across all inputs.
+- **Estimation.** With a `profile_key`, the keyed profile is used once it has at
+  least one observation; until then the estimate falls back to the base profile
+  (with its usual confidence and safety-margin behavior). No `profile_key`
+  behaves exactly as before. Explicit `memory_gb` / `vram_gb` hints still
+  override.
+- **Feasibility.** The submit-time infeasibility check uses whichever estimate
+  applies — so a bucket known to be too big for the machine fails fast, while
+  smaller buckets of the same function keep flowing.
+- **Persistence.** Keyed profiles round-trip through the JSON store exactly like
+  base profiles (the store keys are just strings).
+
 ## How It Works
 
 1. **Submission**: When you submit work, the executor looks up the function's resource profile
