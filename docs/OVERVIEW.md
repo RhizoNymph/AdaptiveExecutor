@@ -115,18 +115,27 @@ Overview:
     first completion warms the profile and the queued siblings unclamp with a
     learned estimate. For each decision the executor obtains an idle
     worker pinned to the required GPU (spawning or evicting+replacing as
-    necessary) and sends the WorkItem over that worker's queue. The worker
-    executes, measures usage, and returns a WorkResult on the shared result
-    queue. A result thread resolves the future and records the
-    ResourceObservation (including duration_seconds) into the ProfileStore under
-    both the base and (when the task carried a profile_key) the keyed profile,
-    which persists to disk in a debounced fashion. When a worker is SIGKILLed
-    under memory pressure (OOM), the crash-retry path records a persistent
-    memory floor into the profile (base and keyed) — the estimate proven too
-    small — so the next batch of fresh submits is lower-bounded and does not
-    repeat the crash, even though the crashing run itself reported no
-    observation. Workers are recycled after a configurable number of tasks and
-    reaped without leaving zombies.
+    necessary) and — immediately before shipping — runs the future's
+    set_running_or_notify_cancel() handshake: a queued task the caller cancelled
+    is dropped here and never dispatched, while a task that clears the handshake
+    is now RUNNING and can no longer be cancelled. It then sends the WorkItem
+    over that worker's queue. The worker executes, measures usage, and returns a
+    WorkResult on its OWN per-worker result queue. A result thread sweeps every
+    live worker's queue and resolves the future (via cancellation-safe settling
+    that drops a result whose future is already done rather than raising),
+    recording the ResourceObservation (including duration_seconds) into the
+    ProfileStore under both the base and (when the task carried a profile_key)
+    the keyed profile, which persists to disk in a debounced fashion. Per-worker
+    result queues isolate worker-kill corruption: killing a worker mid-``put``
+    (timeout kill, eviction) can only wedge that worker's own queue, which is
+    poisoned and discarded, never a queue shared with other workers. Gracefully
+    retired and crashed workers have their queue drained after exit (so no final
+    result is lost) then discarded. When a worker is SIGKILLed under memory
+    pressure (OOM), the crash-retry path records a persistent memory floor into
+    the profile (base and keyed) — the estimate proven too small — so the next
+    batch of fresh submits is lower-bounded and does not repeat the crash, even
+    though the crashing run itself reported no observation. Workers are recycled
+    after a configurable number of tasks and reaped without leaving zombies.
 
 Features Index:
   executor:
