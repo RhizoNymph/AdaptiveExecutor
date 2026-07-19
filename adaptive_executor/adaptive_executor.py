@@ -65,6 +65,8 @@ class AdaptiveExecutor:
         on_timeout: Literal["fail_future", "kill_worker"] = "fail_future",
         max_resource_crash_retries: int = 1,
         worker_recycle_after_tasks: int | None = 50,
+        monitor: "ResourceMonitor | None" = None,
+        clock: Callable[[], float] = time.time,
     ):
         self.max_workers = max_workers or os.cpu_count() or 4
         self.gpu_ids = gpu_ids
@@ -77,7 +79,11 @@ class AdaptiveExecutor:
         self._next_gpu_index = 0
         self._next_worker_id = 0
 
-        self.monitor = ResourceMonitor()
+        # Time source and monitor are injectable seams so a deterministic
+        # simulation can substitute a virtual clock and a synthetic monitor.
+        # Defaults preserve exactly the production wall-clock/NVML behavior.
+        self._clock = clock
+        self.monitor = monitor if monitor is not None else ResourceMonitor()
         self.profiles = ProfileStore(persist_path=profile_path)
 
         self.result_queue: mp.Queue = mp.Queue()
@@ -197,7 +203,7 @@ class AdaptiveExecutor:
             item=item,
             future=future,
             estimate=estimate,
-            submitted_at=time.time(),
+            submitted_at=self._clock(),
         )
 
         with self.lock:
@@ -242,7 +248,7 @@ class AdaptiveExecutor:
                 self.pending.popleft()
                 pending.assigned_gpu_id = gpu_id
                 pending.worker_id = worker.worker_id
-                pending.started_at = time.time()
+                pending.started_at = self._clock()
                 self.in_flight[pending.item.id] = pending
                 worker.current_work_id = pending.item.id
                 worker.work_queue.put(replace(pending.item, gpu_id=gpu_id))
@@ -454,40 +460,49 @@ class AdaptiveExecutor:
             except Empty:
                 continue
 
-            with self.lock:
-                worker = self.workers.get(result.worker_id)
-                if worker is not None and worker.current_work_id == result.id:
-                    worker.current_work_id = None
-                    worker.tasks_completed += 1
-                    # Recycle a worker that has processed enough tasks so its RSS
-                    # baseline (which CPython rarely returns to the OS) cannot
-                    # ratchet up and cause future memory observations to shrink.
-                    if self._should_recycle(worker):
-                        self._retire_worker(worker, reason="recycle")
+            self._process_result(result)
 
-                pending = self.in_flight.pop(result.id, None)
-                if pending is None:
-                    continue
+    def _process_result(self, result: WorkResult) -> None:
+        """Handle a single worker result: clear/recycle the worker, pop the
+        in-flight entry, record the observation, and resolve the future.
 
-                if pending.result_ignored:
-                    self.completed_or_abandoned.add(result.id)
-                    continue
+        Extracted from the ``_collect_results`` loop body so the same logic can
+        be driven one result at a time (e.g. by a deterministic simulation).
+        """
+        with self.lock:
+            worker = self.workers.get(result.worker_id)
+            if worker is not None and worker.current_work_id == result.id:
+                worker.current_work_id = None
+                worker.tasks_completed += 1
+                # Recycle a worker that has processed enough tasks so its RSS
+                # baseline (which CPython rarely returns to the OS) cannot
+                # ratchet up and cause future memory observations to shrink.
+                if self._should_recycle(worker):
+                    self._retire_worker(worker, reason="recycle")
 
-            self.profiles.record(
-                pending.item.fn_module,
-                pending.item.fn_name,
-                result.observation,
-            )
+            pending = self.in_flight.pop(result.id, None)
+            if pending is None:
+                return
 
-            if result.success:
-                pending.future.set_result(result.result)
-            else:
-                pending.future.set_exception(result.exception)
+            if pending.result_ignored:
+                self.completed_or_abandoned.add(result.id)
+                return
+
+        self.profiles.record(
+            pending.item.fn_module,
+            pending.item.fn_name,
+            result.observation,
+        )
+
+        if result.success:
+            pending.future.set_result(result.result)
+        else:
+            pending.future.set_exception(result.exception)
 
     def _check_timeouts(self):
         while not self._threads_should_stop:
             time.sleep(0.1)
-            now = time.time()
+            now = self._clock()
             timed_out: list[PendingWork] = []
 
             with self.lock:
