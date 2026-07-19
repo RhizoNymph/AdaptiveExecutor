@@ -36,6 +36,16 @@ Overview:
     dtypes:
       module: adaptive_executor/dtypes.py
       role: Dataclasses for snapshots, observations, estimates, work items/results.
+    scheduler_sim:
+      module: tests/sim/
+      role: >
+        Test-only deterministic discrete-event harness. Drives the executor's
+        real dispatch/admission methods (_maybe_dispatch, _can_admit,
+        _pick_round_robin_gpu, committed-resource accounting, _handle_dead_worker,
+        _process_result) against a virtual clock and synthetic workloads -- no
+        subprocesses, no NVML, no wall-clock sleeps -- and asserts scheduling
+        invariants over a recorded virtual-time trace. See
+        docs/features/scheduler-sim.md.
   data_flow: >
     submit() validates the callable is importable, looks up its LearnedProfile,
     and computes a ResourceEstimate. A background dispatch thread checks
@@ -63,3 +73,26 @@ Features Index:
       - profiles
       - resolve
     doc: docs/features/executor.md
+  scheduler_sim:
+    description: >
+      Deterministic discrete-event simulation of the scheduler for
+      property-style tests (admission/headroom, committed accounting, FIFO,
+      head-of-line, OOM-retry storms, no-lost-tasks). Policy under test is a
+      parameter so a future backfill scheduler can reuse the harness.
+    entry_points:
+      - tests/sim/harness.py::SchedulerSim.run
+      - tests/sim/harness.py::run_to_quiescence
+    depends_on:
+      - executor
+    doc: docs/features/scheduler-sim.md
+
+Testing:
+  note: >
+    Beyond the wall-clock concurrency tests, tests/sim/ hosts a virtual-clock
+    discrete-event harness that drives the real scheduling logic deterministically.
+    To make fakes substitutable without changing production behavior, the
+    executor exposes three dependency-injection seams (all defaulting to today's
+    behavior): a ``clock`` time source (defaults to time.time), an injectable
+    ``monitor`` (defaults to ResourceMonitor()), and worker spawning via the
+    overridable ``_spawn_worker``. The per-result handling was extracted into
+    ``_process_result`` so a single result can be driven through the real path.
