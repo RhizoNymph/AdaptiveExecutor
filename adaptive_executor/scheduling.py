@@ -33,6 +33,8 @@ ends of the task's life:
 * While an exclusive task is *in flight* (present in ``running``),
   :func:`plan_dispatch` returns an empty plan — nothing else is dispatched
   until it leaves the running set (completes, fails, or crashes).
+* When an exclusive task is *admitted*, the plan ends with it — nothing is
+  co-admitted in the same dispatch cycle.
 * While an exclusive task is the blocked *head*, it admits no backfill (it needs
   the in-flight set to drain to empty, and admitting anything would delay that).
 
@@ -189,6 +191,10 @@ class _Planner:
             self.pools.rr = new_rr
             self._admit(head, gpu_id, releases_before_reservation=None)
             self.queue.pop(0)
+            if head.exclusive:
+                # An exclusive admission owns the machine from the moment it
+                # starts: end the cycle here so nothing is co-admitted with it.
+                return self._plan()
         else:
             # Whole queue drained; nothing is blocked.
             return self._plan()

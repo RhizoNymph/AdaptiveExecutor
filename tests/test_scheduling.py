@@ -186,8 +186,10 @@ def test_exclusive_head_admitted_when_idle():
     head = _pending("head", mem=1.0, exclusive=True)
     behind = _pending("behind", mem=1.0)
     plan = plan_dispatch([head, behind], [], _cap(memory_free=100.0, running_count=0))
-    # Idle: exclusive head admits, then 'behind' also fits as the new front.
-    assert _ids(plan) == ["head", "behind"]
+    # Idle: the exclusive head admits — alone. Exclusive means "runs alone,
+    # start to finish", so nothing is co-admitted in the same cycle; 'behind'
+    # waits until the exclusive task finishes.
+    assert _ids(plan) == ["head"]
 
 
 # --- per-GPU reservation accounting -----------------------------------------
