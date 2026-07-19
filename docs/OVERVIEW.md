@@ -103,12 +103,17 @@ Overview:
     delay the head's reservation. For each decision the executor obtains an idle
     worker pinned to the required GPU (spawning or evicting+replacing as
     necessary) and sends the WorkItem over that worker's queue. The worker
-    executes, measures usage, and returns a WorkResult on the shared result
-    queue. A result thread resolves the future and records the
-    ResourceObservation (including duration_seconds) into the ProfileStore under
-    both the base and (when the task carried a profile_key) the keyed profile,
-    which persists to disk in a debounced fashion. Workers are recycled after a
-    configurable number of tasks and reaped without leaving zombies.
+    executes, measures usage, and returns a WorkResult on its OWN per-worker
+    result queue. A result thread sweeps every live worker's queue and resolves
+    the future, recording the ResourceObservation (including duration_seconds)
+    into the ProfileStore under both the base and (when the task carried a
+    profile_key) the keyed profile, which persists to disk in a debounced
+    fashion. Per-worker result queues isolate worker-kill corruption: killing a
+    worker mid-``put`` (timeout kill, eviction) can only wedge that worker's own
+    queue, which is poisoned and discarded, never a queue shared with other
+    workers. Gracefully retired and crashed workers have their queue drained
+    after exit (so no final result is lost) then discarded. Workers are recycled
+    after a configurable number of tasks and reaped without leaving zombies.
 
 Features Index:
   executor:

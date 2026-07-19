@@ -71,10 +71,22 @@ class WorkerSlot:
     process: mp.Process
     work_queue: mp.Queue
     pinned_gpu_id: int | None
+    # Per-worker result queue. Each worker ``put()``s its results onto its OWN
+    # queue so that a worker killed mid-``put`` (timeout kill, eviction) can only
+    # corrupt its own queue's shared feeder state, never a queue shared with
+    # other workers. Production always populates this in ``_spawn_worker``; it is
+    # optional only so test fakes may construct a slot without a real queue.
+    result_queue: "mp.Queue | None" = None
     current_work_id: str | None = None
     intentionally_stopped: bool = False
     pending_retry_work_id: str | None = None
     tasks_completed: int = 0
+    # Queue lifecycle bookkeeping. ``queue_poisoned`` marks a queue whose owning
+    # worker was intentionally killed (SIGTERM/SIGKILL) while possibly mid-``put``:
+    # it must never be read again (its feeder state may be wedged) and is
+    # discarded, not drained. ``queue_discarded`` makes teardown idempotent.
+    queue_poisoned: bool = False
+    queue_discarded: bool = False
 
 
 class AdaptiveExecutor:
@@ -119,7 +131,10 @@ class AdaptiveExecutor:
         self.monitor = monitor if monitor is not None else ResourceMonitor()
         self.profiles = ProfileStore(persist_path=profile_path)
 
-        self.result_queue: mp.Queue = mp.Queue()
+        # Result collection is per-worker (see ``WorkerSlot.result_queue``); there
+        # is deliberately no shared result queue. The kill grace period is how
+        # long a terminated worker is given to exit on SIGTERM before SIGKILL.
+        self._kill_grace_seconds = 0.5
         self.workers: dict[int, WorkerSlot] = {}
         # Workers removed from the pool (retired/recycled/evicted) awaiting reap.
         self._retiring: list[WorkerSlot] = []
@@ -658,9 +673,10 @@ class AdaptiveExecutor:
         self._next_worker_id += 1
 
         work_queue: mp.Queue = mp.Queue()
+        result_queue: mp.Queue = mp.Queue()
         process = mp.Process(
             target=worker_process_entry,
-            args=(work_queue, self.result_queue, worker_id, pinned_gpu_id),
+            args=(work_queue, result_queue, worker_id, pinned_gpu_id),
         )
         process.start()
 
@@ -668,19 +684,119 @@ class AdaptiveExecutor:
             worker_id=worker_id,
             process=process,
             work_queue=work_queue,
+            result_queue=result_queue,
             pinned_gpu_id=pinned_gpu_id,
         )
         self.workers[worker_id] = worker
         return worker
 
     def _collect_results(self):
-        while not self._threads_should_stop or self.in_flight:
-            try:
-                result: WorkResult = self.result_queue.get(timeout=0.1)
-            except Empty:
-                continue
+        """Continuously sweep every live worker's own result queue.
 
+        Each worker owns its result queue, so the collector polls all of them
+        with a non-blocking ``get_nowait()`` sweep and sleeps briefly when idle
+        (CPU-cheap). A poisoned queue (its worker was intentionally killed and
+        may have corrupted its own feeder state) is skipped and never read; it is
+        discarded with the worker. Draining of retired/dead workers happens at
+        reap time, so a worker leaving the pool never strands a delivered result.
+        """
+        while not self._threads_should_stop or self.in_flight:
+            if not self._sweep_result_queues():
+                time.sleep(0.01)
+
+    def _sweep_result_queues(self) -> bool:
+        """Drain all pending results from live, non-poisoned worker queues.
+
+        Returns True if any result was processed this sweep (so the caller can
+        skip its idle sleep and keep up under load).
+        """
+        with self.lock:
+            slots = list(self.workers.values())
+
+        processed_any = False
+        for slot in slots:
+            for result in self._read_queue(slot):
+                processed_any = True
+                self._process_result(result)
+        return processed_any
+
+    def _read_queue(self, slot: WorkerSlot) -> list[WorkResult]:
+        """Non-blocking drain of one worker's result queue into a list.
+
+        Never reads a poisoned or already-discarded queue. Narrow, typed excepts
+        only: a closed/torn-down queue (``OSError``/``ValueError``) ends the read
+        without propagating into the collector thread.
+        """
+        queue = slot.result_queue
+        if queue is None or slot.queue_poisoned or slot.queue_discarded:
+            return []
+        results: list[WorkResult] = []
+        while True:
+            try:
+                results.append(queue.get_nowait())
+            except Empty:
+                break
+            except (OSError, ValueError) as exc:
+                logger.debug(
+                    "result queue read failed worker_id=%d error=%r",
+                    slot.worker_id,
+                    exc,
+                )
+                break
+        return results
+
+    def _drain_queue(self, slot: WorkerSlot) -> None:
+        """Process any final results a gracefully-exited worker left behind.
+
+        Must only be called after the worker process has exited (no more puts),
+        so ``get_nowait()`` reaches ``Empty`` and cannot block. Poisoned queues
+        are never drained (their feeder state may be corrupt).
+        """
+        if slot.queue_poisoned:
+            return
+        results = self._read_queue(slot)
+        if results:
+            logger.debug(
+                "drained %d final result(s) worker_id=%d",
+                len(results),
+                slot.worker_id,
+            )
+        for result in results:
             self._process_result(result)
+
+    def _discard_queue(self, slot: WorkerSlot) -> None:
+        """Release a worker's result queue. Idempotent.
+
+        Closes the queue and cancels its join thread so a discard can never block
+        the parent on GC/interpreter exit, whether the queue was drained
+        (graceful retire) or poisoned (killed worker).
+        """
+        if slot.queue_discarded:
+            return
+        slot.queue_discarded = True
+        queue = slot.result_queue
+        if queue is None:
+            return
+        cancel = getattr(queue, "cancel_join_thread", None)
+        if cancel is not None:
+            try:
+                cancel()
+            except (OSError, ValueError) as exc:
+                logger.debug(
+                    "cancel_join_thread failed worker_id=%d error=%r",
+                    slot.worker_id,
+                    exc,
+                )
+        close = getattr(queue, "close", None)
+        if close is not None:
+            try:
+                close()
+            except (OSError, ValueError) as exc:
+                logger.debug(
+                    "result queue close failed worker_id=%d error=%r",
+                    slot.worker_id,
+                    exc,
+                )
 
     def _process_result(self, result: WorkResult) -> None:
         """Handle a single worker result: clear/recycle the worker, pop the
@@ -737,6 +853,7 @@ class AdaptiveExecutor:
                 self._handle_timeout(pending)
 
     def _handle_timeout(self, pending: PendingWork):
+        worker_to_kill: WorkerSlot | None = None
         with self.lock:
             active = self.in_flight.get(pending.item.id)
             if active is None or active.future.done():
@@ -745,10 +862,19 @@ class AdaptiveExecutor:
             if self.on_timeout == "kill_worker" and active.worker_id is not None:
                 worker = self.workers.get(active.worker_id)
                 if worker is not None:
+                    # Poison and evict the worker from the pool BEFORE killing it.
+                    # Poisoning under the lock guarantees the collector will never
+                    # read this queue again (its feeder state may be wedged by a
+                    # signal landing mid-``put``). The worker is parked in
+                    # ``_retiring`` so ``_check_workers`` reaps it (join + discard,
+                    # no drain). Its blast radius is now this worker only.
                     worker.intentionally_stopped = True
+                    worker.queue_poisoned = True
                     worker.pending_retry_work_id = None
-                    worker.process.terminate()
                     worker.current_work_id = None
+                    self.workers.pop(worker.worker_id, None)
+                    self._retiring.append(worker)
+                    worker_to_kill = worker
                 self.in_flight.pop(active.item.id, None)
             else:
                 active.result_ignored = True
@@ -757,10 +883,49 @@ class AdaptiveExecutor:
                 if worker is not None and worker.current_work_id == active.item.id:
                     worker.current_work_id = None
 
+        # Kill outside the lock: escalation may briefly join on the process.
+        if worker_to_kill is not None:
+            self._escalate_kill(worker_to_kill)
+
         active.future.set_exception(
             TimeoutError(f"Task {active.item.id} timed out after {self.task_timeout_seconds}s")
         )
         self.completed_or_abandoned.add(active.item.id)
+
+    def _escalate_kill(self, worker: WorkerSlot) -> None:
+        """Terminate a worker, escalating SIGTERM -> SIGKILL if it does not exit.
+
+        The worker installs no SIGTERM handler, so default SIGTERM normally kills
+        it immediately; the escalation only matters if a task ignores/blocks
+        SIGTERM. Either way the corruption risk is gone: only this worker's own
+        (poisoned, about-to-be-discarded) queue can be affected. The actual reap
+        (join + queue discard) is done by ``_check_workers``.
+        """
+        process = worker.process
+        logger.info(
+            "killing worker worker_id=%d signal=SIGTERM reason=timeout",
+            worker.worker_id,
+        )
+        try:
+            process.terminate()
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "terminate failed worker_id=%d error=%r", worker.worker_id, exc
+            )
+            return
+
+        process.join(timeout=self._kill_grace_seconds)
+        if process.is_alive():
+            logger.warning(
+                "worker survived SIGTERM; escalating worker_id=%d signal=SIGKILL",
+                worker.worker_id,
+            )
+            try:
+                process.kill()
+            except (OSError, ValueError) as exc:
+                logger.warning(
+                    "kill failed worker_id=%d error=%r", worker.worker_id, exc
+                )
 
     def _check_workers(self):
         dead_workers: list[WorkerSlot] = []
@@ -784,13 +949,33 @@ class AdaptiveExecutor:
 
         for worker in reaped:
             worker.process.join(timeout=0.1)
-            logger.debug("reaped retired worker worker_id=%d", worker.worker_id)
+            # A gracefully retired worker (recycle/eviction/shutdown sentinel) may
+            # have delivered a final result before exiting on its sentinel; drain
+            # it so nothing is lost, then discard. A poisoned (killed) worker's
+            # queue is discarded WITHOUT draining -- its feeder state may be
+            # corrupt and reading it could wedge the collector.
+            self._drain_queue(worker)
+            self._discard_queue(worker)
+            logger.debug(
+                "reaped retired worker worker_id=%d poisoned=%s",
+                worker.worker_id,
+                worker.queue_poisoned,
+            )
 
         for worker in dead_workers:
             self._handle_dead_worker(worker)
 
     def _handle_dead_worker(self, worker: WorkerSlot):
         worker.process.join(timeout=0.1)
+
+        # A crashed worker may have delivered a final result for an EARLIER task
+        # before dying; drain-then-discard so that result is not lost. Draining
+        # feeds ``_process_result``, which -- because the worker is no longer in
+        # ``self.workers`` -- simply resolves the future and pops ``in_flight``.
+        # If the drained result was for ``current_work_id``, that task is now
+        # already resolved and the loss handling below finds nothing to do.
+        self._drain_queue(worker)
+        self._discard_queue(worker)
 
         lost_pending: PendingWork | None = None
         if worker.current_work_id is not None:
@@ -860,7 +1045,14 @@ class AdaptiveExecutor:
     def _stop_all_workers(self, wait: bool):
         for worker in list(self.workers.values()):
             worker.intentionally_stopped = True
-            worker.work_queue.put(None)
+            try:
+                worker.work_queue.put(None)
+            except (ValueError, OSError) as exc:
+                logger.warning(
+                    "failed to send stop sentinel worker_id=%d error=%r",
+                    worker.worker_id,
+                    exc,
+                )
 
         to_join = list(self.workers.values()) + list(self._retiring)
 
@@ -871,6 +1063,12 @@ class AdaptiveExecutor:
         for worker in to_join:
             if not worker.process.is_alive():
                 worker.process.join(timeout=0.1)
+            # Deliver any final in-flight result the worker produced before it
+            # exited on the sentinel, then release the queue. Poisoned queues are
+            # discarded without draining.
+            if not worker.process.is_alive():
+                self._drain_queue(worker)
+            self._discard_queue(worker)
 
         self._retiring = [w for w in self._retiring if w.process.is_alive()]
 
