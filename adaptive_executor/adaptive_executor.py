@@ -1,3 +1,4 @@
+import logging
 import multiprocessing as mp
 import os
 import signal
@@ -13,7 +14,10 @@ from typing import Callable, Literal
 from .dtypes import ResourceEstimate, WorkItem, WorkResult
 from .monitor import ResourceMonitor
 from .profiles import ProfileStore
+from .resolve import validate_submittable
 from .worker import worker_process_entry
+
+logger = logging.getLogger("adaptive_executor")
 
 
 @dataclass
@@ -39,6 +43,7 @@ class WorkerSlot:
     current_work_id: str | None = None
     intentionally_stopped: bool = False
     pending_retry_work_id: str | None = None
+    tasks_completed: int = 0
 
 
 class AdaptiveExecutor:
@@ -58,6 +63,7 @@ class AdaptiveExecutor:
         task_timeout_seconds: float = 300.0,
         on_timeout: Literal["fail_future", "kill_worker"] = "fail_future",
         max_resource_crash_retries: int = 1,
+        worker_recycle_after_tasks: int | None = 50,
     ):
         self.max_workers = max_workers or os.cpu_count() or 4
         self.gpu_ids = gpu_ids
@@ -66,6 +72,7 @@ class AdaptiveExecutor:
         self.task_timeout_seconds = task_timeout_seconds
         self.on_timeout = on_timeout
         self.max_resource_crash_retries = max_resource_crash_retries
+        self.worker_recycle_after_tasks = worker_recycle_after_tasks
         self._next_gpu_index = 0
         self._next_worker_id = 0
 
@@ -74,6 +81,8 @@ class AdaptiveExecutor:
 
         self.result_queue: mp.Queue = mp.Queue()
         self.workers: dict[int, WorkerSlot] = {}
+        # Workers removed from the pool (retired/recycled/evicted) awaiting reap.
+        self._retiring: list[WorkerSlot] = []
 
         self.pending: deque[PendingWork] = deque()
         self.in_flight: dict[str, PendingWork] = {}
@@ -127,6 +136,7 @@ class AdaptiveExecutor:
         self._threads_should_stop = True
         self._stop_all_workers(wait=wait)
         self._join_background_threads()
+        self.profiles.flush()
         self.monitor.stop()
 
     def submit(
@@ -152,6 +162,11 @@ class AdaptiveExecutor:
         """
         if self._shutdown or not self._accepting:
             raise RuntimeError("Cannot submit to a shutdown AdaptiveExecutor")
+
+        # Fail fast on functions that cannot be re-resolved in a worker
+        # subprocess (lambdas, closures, bound methods, unimportable callables).
+        validate_submittable(fn)
+
         if not self._started:
             self.start()
 
@@ -280,13 +295,71 @@ class AdaptiveExecutor:
 
     def _get_or_spawn_idle_worker(self, pinned_gpu_id: int | None) -> WorkerSlot | None:
         for worker in self.workers.values():
-            if worker.pinned_gpu_id == pinned_gpu_id and worker.current_work_id is None and worker.process.is_alive():
+            if (
+                worker.pinned_gpu_id == pinned_gpu_id
+                and worker.current_work_id is None
+                and not worker.intentionally_stopped
+                and worker.process.is_alive()
+            ):
                 return worker
 
         if len(self.workers) >= self.max_workers:
-            return None
+            # At the cap with no matching idle worker. If some idle worker is
+            # pinned differently, evict it so a correctly-pinned replacement can
+            # be spawned; this prevents a permanent dispatch stall. If every
+            # worker is genuinely busy, return None (correct backpressure).
+            victim = self._find_idle_evictable_worker()
+            if victim is None:
+                return None
+            self._retire_worker(victim, reason="pin_mismatch")
 
         return self._spawn_worker(pinned_gpu_id)
+
+    def _find_idle_evictable_worker(self) -> WorkerSlot | None:
+        """Return an alive, idle, not-already-retiring worker, or None."""
+        for worker in self.workers.values():
+            if (
+                worker.current_work_id is None
+                and not worker.intentionally_stopped
+                and worker.process.is_alive()
+            ):
+                return worker
+        return None
+
+    def _retire_worker(self, worker: WorkerSlot, reason: str) -> None:
+        """Remove ``worker`` from the pool and schedule it for reaping.
+
+        Must be called while holding ``self.lock``. Sends the stop sentinel,
+        marks the worker as intentionally stopped, drops it from ``self.workers``
+        so the cap frees immediately, and parks it in ``self._retiring`` to be
+        joined by ``_check_workers``.
+        """
+        worker.intentionally_stopped = True
+        worker.pending_retry_work_id = None
+        try:
+            worker.work_queue.put(None)
+        except (ValueError, OSError) as exc:
+            logger.warning(
+                "failed to send stop sentinel worker_id=%d error=%r",
+                worker.worker_id,
+                exc,
+            )
+        self.workers.pop(worker.worker_id, None)
+        self._retiring.append(worker)
+        logger.debug(
+            "retired worker worker_id=%d pinned_gpu_id=%s reason=%s tasks_completed=%d",
+            worker.worker_id,
+            worker.pinned_gpu_id,
+            reason,
+            worker.tasks_completed,
+        )
+
+    def _should_recycle(self, worker: WorkerSlot) -> bool:
+        if self.worker_recycle_after_tasks is None:
+            return False
+        if worker.intentionally_stopped:
+            return False
+        return worker.tasks_completed >= self.worker_recycle_after_tasks
 
     def _spawn_worker(self, pinned_gpu_id: int | None) -> WorkerSlot:
         worker_id = self._next_worker_id
@@ -319,6 +392,12 @@ class AdaptiveExecutor:
                 worker = self.workers.get(result.worker_id)
                 if worker is not None and worker.current_work_id == result.id:
                     worker.current_work_id = None
+                    worker.tasks_completed += 1
+                    # Recycle a worker that has processed enough tasks so its RSS
+                    # baseline (which CPython rarely returns to the OS) cannot
+                    # ratchet up and cause future memory observations to shrink.
+                    if self._should_recycle(worker):
+                        self._retire_worker(worker, reason="recycle")
 
                 pending = self.in_flight.pop(result.id, None)
                 if pending is None:
@@ -383,12 +462,27 @@ class AdaptiveExecutor:
 
     def _check_workers(self):
         dead_workers: list[WorkerSlot] = []
+        reaped: list[WorkerSlot] = []
         with self.lock:
             for worker in list(self.workers.values()):
                 if worker.process.is_alive():
                     continue
                 dead_workers.append(worker)
                 self.workers.pop(worker.worker_id, None)
+
+            # Reap retired/recycled/evicted workers that have exited so no
+            # zombies accumulate; keep the ones still shutting down.
+            still_retiring: list[WorkerSlot] = []
+            for worker in self._retiring:
+                if worker.process.is_alive():
+                    still_retiring.append(worker)
+                else:
+                    reaped.append(worker)
+            self._retiring = still_retiring
+
+        for worker in reaped:
+            worker.process.join(timeout=0.1)
+            logger.debug("reaped retired worker worker_id=%d", worker.worker_id)
 
         for worker in dead_workers:
             self._handle_dead_worker(worker)
@@ -459,13 +553,17 @@ class AdaptiveExecutor:
             worker.intentionally_stopped = True
             worker.work_queue.put(None)
 
+        to_join = list(self.workers.values()) + list(self._retiring)
+
         if wait:
-            for worker in list(self.workers.values()):
+            for worker in to_join:
                 worker.process.join(timeout=5.0)
 
-        for worker in list(self.workers.values()):
+        for worker in to_join:
             if not worker.process.is_alive():
                 worker.process.join(timeout=0.1)
+
+        self._retiring = [w for w in self._retiring if w.process.is_alive()]
 
     def _join_background_threads(self):
         for name in ("_dispatch_thread", "_timeout_thread", "_result_thread"):
