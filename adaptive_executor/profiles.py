@@ -55,6 +55,14 @@ class LearnedProfile:
         else:
             cpu_cores = 1.0
 
+        # p90 run duration, or None when there is no observed history. A function
+        # with no history has an unknown duration, which backfill scheduling
+        # treats as infinite (the task is assumed never to release resources).
+        if self.observations:
+            duration_p90 = self.percentile([o.duration_seconds for o in self.observations], 0.9)
+        else:
+            duration_p90 = None
+
         confidence = min(1.0, self.sample_count / 10.0)
 
         # Apply safety margin when confidence is low.
@@ -66,6 +74,7 @@ class LearnedProfile:
             vram_gb=max(0.0, vram * safety_multiplier),
             cpu_cores=max(0.1, cpu_cores),  # CPU doesn't need safety margin
             confidence=confidence,
+            duration_p90_seconds=duration_p90,
         )
 
 

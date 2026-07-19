@@ -12,7 +12,18 @@ Overview:
       role: >
         Public API (submit/shutdown), background dispatch/result/timeout
         threads, worker pool lifecycle (spawn/reuse/evict/recycle/reap),
-        admission control, GPU round-robin, crash retry.
+        admission control, GPU round-robin, crash retry. Gathers live state each
+        dispatch cycle and delegates the ordering decision to the scheduling
+        subsystem.
+    scheduling:
+      module: adaptive_executor/scheduling.py
+      role: >
+        Pure, deterministic EASY (reservation-based) backfill scheduler. Given
+        FIFO pending entries (with resource estimates + p90 durations), running
+        entries (with remaining time), and per-GPU capacity/headroom, it returns
+        the set of tasks to dispatch this cycle so that later tasks may backfill
+        past a blocked head only when they cannot delay the head's reservation.
+        No threads, no I/O, no executor state.
     worker:
       module: adaptive_executor/worker.py
       role: >
@@ -54,21 +65,27 @@ Overview:
         docs/features/scheduler-sim.md.
   data_flow: >
     submit() validates the callable is importable, looks up its LearnedProfile,
-    and computes a ResourceEstimate. It then checks feasibility against known
-    capacity (total minus headroom) and raises InfeasibleTaskError synchronously
-    if the estimate can never fit, so an impossible task fails at the call site
-    instead of blocking the FIFO head forever. A background dispatch thread
-    re-checks feasibility on the head task (an estimate can become infeasible
-    after crash-retry penalization doubles it) and, if infeasible, pops it and
-    sets InfeasibleTaskError on its future without killing the thread. Otherwise
-    it checks admission (_can_admit) against the latest monitor snapshot plus
-    committed
-    in-flight estimates, picks a GPU when needed, obtains an idle worker pinned
-    to the required GPU (spawning or evicting+replacing as necessary), and sends
-    the WorkItem over that worker's queue. The worker executes, measures usage,
-    and returns a WorkResult on the shared result queue. A result thread resolves
-    the future and records the ResourceObservation into the ProfileStore, which
-    persists to disk in a debounced fashion. Workers are recycled after a
+    and computes a ResourceEstimate (p90 memory/VRAM/CPU plus a p90 run
+    duration). It then checks feasibility against known capacity (total minus
+    headroom) and raises InfeasibleTaskError synchronously if the estimate can
+    never fit, so an impossible task fails at the call site instead of silently
+    queuing forever. A background dispatch thread first re-checks feasibility
+    across the pending queue (an estimate can become infeasible after
+    crash-retry penalization doubles it) and sets InfeasibleTaskError on any
+    such task's future without killing the thread. It then gathers live state
+    each cycle (monitor snapshot, committed in-flight estimates, per-GPU VRAM,
+    running tasks' elapsed-vs-expected times) into the scheduling subsystem's
+    input dataclasses and calls plan_dispatch(). The scheduler returns an
+    ordered set of dispatch decisions (which pending tasks to start now and on
+    which GPU): front tasks are admitted in strict FIFO order while they fit,
+    and when the head is blocked, later tasks may backfill only if they cannot
+    delay the head's reservation. For each decision the executor obtains an idle
+    worker pinned to the required GPU (spawning or evicting+replacing as
+    necessary) and sends the WorkItem over that worker's queue. The worker
+    executes, measures usage, and returns a WorkResult on the shared result
+    queue. A result thread resolves the future and records the
+    ResourceObservation (including duration_seconds) into the ProfileStore,
+    which persists to disk in a debounced fashion. Workers are recycled after a
     configurable number of tasks and reaped without leaving zombies.
 
 Features Index:
@@ -85,14 +102,30 @@ Features Index:
       - monitor
       - profiles
       - resolve
+      - backfill_scheduling
       - errors
     doc: docs/features/executor.md
+  backfill_scheduling:
+    description: >
+      Reservation-based EASY backfill: when the head of the queue is blocked,
+      later tasks may be dispatched ahead of it only when they cannot delay the
+      head's resource reservation. Preserves the "never later than FIFO"
+      invariant and per-GPU VRAM accounting; an exclusive head blocks all
+      backfill.
+    entry_points:
+      - adaptive_executor.scheduling.plan_dispatch
+      - adaptive_executor.AdaptiveExecutor._build_dispatch_plan
+      - adaptive_executor.AdaptiveExecutor._maybe_dispatch
+    depends_on:
+      - executor
+      - profiles
+    doc: docs/features/backfill-scheduling.md
   scheduler_sim:
     description: >
       Deterministic discrete-event simulation of the scheduler for
-      property-style tests (admission/headroom, committed accounting, FIFO,
-      head-of-line, OOM-retry storms, no-lost-tasks). Policy under test is a
-      parameter so a future backfill scheduler can reuse the harness.
+      property-style tests (admission/headroom, committed accounting,
+      head-not-delayed-vs-FIFO, head-of-line, OOM-retry storms, no-lost-tasks).
+      Policy under test is a parameter.
     entry_points:
       - tests/sim/harness.py::SchedulerSim.run
       - tests/sim/harness.py::run_to_quiescence

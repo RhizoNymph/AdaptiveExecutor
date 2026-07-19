@@ -4,7 +4,7 @@ The harness constructs a real :class:`AdaptiveExecutor`, injects a virtual
 clock and a synthetic monitor, and stubs worker spawning with in-process
 :class:`FakeProcess` / :class:`FakeQueue` (from ``tests/fakes.py``). It then
 drives the executor's *real* scheduling methods -- ``_check_workers``,
-``_maybe_dispatch`` (and thus ``_can_admit`` / ``_pick_round_robin_gpu`` /
+``_maybe_dispatch`` (and thus ``scheduling.plan_dispatch`` /
 committed-resource accounting), ``_handle_dead_worker`` and ``_process_result``
 -- one event at a time against a monotonically advancing virtual clock. No
 background threads run, no real time passes, and results are injected through

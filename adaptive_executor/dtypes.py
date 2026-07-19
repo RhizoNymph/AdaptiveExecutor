@@ -28,6 +28,10 @@ class ResourceEstimate:
     vram_gb: float
     cpu_cores: float
     confidence: float = 0.0
+    # p90 of observed run durations, or None when the function has no observed
+    # history. None means "unknown duration" and is treated as INFINITE for
+    # backfill-scheduling purposes (the task is assumed to never release).
+    duration_p90_seconds: float | None = None
 
 @dataclass(frozen=True)
 class WorkItem:

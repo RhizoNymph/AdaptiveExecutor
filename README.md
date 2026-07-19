@@ -62,6 +62,21 @@ completed that many tasks and spawns a fresh one on demand. CPython rarely
 returns freed memory to the OS, so a long-lived worker's RSS baseline ratchets
 upward; recycling keeps memory observations accurate. Pass `None` to disable.
 
+### Backfill scheduling
+
+Dispatch is **not** strict head-of-line FIFO. When the task at the front of the
+queue cannot be admitted right now (not enough free RAM/VRAM/worker slots), the
+executor computes a *reservation* for it — the earliest time the currently
+running tasks are expected to release enough resources for it to start — and then
+lets **later** tasks jump ahead (backfill) only when doing so cannot delay that
+reservation. A later task may run ahead if either it fits in capacity that is
+free even after setting aside the head's reservation, or its expected duration
+means it finishes before the reservation. The head never starts later than it
+would under strict FIFO. Reservations respect per-GPU VRAM, and an exclusive
+task (used by OOM-crash retries) at the front blocks all backfill. This is the
+default and only behavior; there is no flag. See
+`docs/features/backfill-scheduling.md`.
+
 ### Profile persistence
 
 When `profile_path` is set, learned profiles are persisted with **debounced**
@@ -135,8 +150,9 @@ For first-run GPU workloads, a nonzero `vram_gb` hint is important if the functi
 1. **Submission**: When you submit work, the executor looks up the function's resource profile
 2. **Estimation**: If no profile exists, uses conservative defaults. Otherwise, uses the 90th percentile of observed usage plus a safety margin
 3. **Admission Control**: Only admits work if projected memory + committed resources < available - headroom
-4. **Execution**: Workers execute tasks and measure actual resource usage
-5. **Learning**: Observations are recorded and used to improve future estimates
+4. **Backfill Scheduling**: When the head of the queue is blocked, later tasks may run ahead if they cannot delay the head's resource reservation (per-GPU aware)
+5. **Execution**: Workers execute tasks and measure actual resource usage
+6. **Learning**: Observations (including run duration) are recorded and used to improve future estimates
 
 ## Requirements
 
