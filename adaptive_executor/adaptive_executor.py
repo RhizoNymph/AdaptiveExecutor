@@ -68,6 +68,25 @@ class PendingWork:
     # the same keyed profile the estimate was drawn from. Survives crash-retry
     # re-queuing because the PendingWork object is reused.
     profile_key: str | None = None
+    # Original user hints captured at submit. Re-estimation re-runs
+    # ``profile.estimate()`` as the profile sharpens while the task waits, and
+    # must keep passing these so a user hint always overrides the learned value.
+    memory_hint: float | None = None
+    vram_hint: float | None = None
+    # Dispatch-time re-estimation bookkeeping: the profile sample count the
+    # current estimate was computed from, and when it was last refreshed (so the
+    # 10ms dispatch tick does not re-copy the profile under lock every cycle).
+    estimate_sample_count: int = 0
+    estimate_refreshed_at: float | None = None
+    # The profile's memory floor the current estimate was computed under. A crash
+    # floor is recorded WITHOUT adding an observation, so re-estimation must also
+    # compare floors — otherwise queued siblings keep their too-small estimates
+    # and repeat the very crash the floor exists to prevent.
+    estimate_floor_gb: float | None = None
+    # Cold-start canary identity: the ProfileStore key estimation actually drew
+    # from this cycle, stamped in ``_build_dispatch_plan`` and carried into
+    # ``in_flight`` so a running canary's identity is known to the scheduler.
+    profile_identity: str | None = None
 
 
 @dataclass
@@ -128,6 +147,9 @@ class AdaptiveExecutor:
         # Cache per-task observed-usage samples this long so psutil/NVML are not
         # polled on every 10ms dispatch tick.
         self._observation_refresh_seconds = 0.1
+        # Re-estimate a waiting task's profile estimate at most this often (the
+        # dispatch loop ticks at 10ms and ``profiles.get`` takes a lock + copies).
+        self._reestimate_interval_seconds = 0.1
 
         # Time source and monitor are injectable seams so a deterministic
         # simulation can substitute a virtual clock and a synthetic monitor.
@@ -268,12 +290,18 @@ class AdaptiveExecutor:
             raise infeasible
 
         future = Future()
+        now = self._clock()
         pending = PendingWork(
             item=item,
             future=future,
             estimate=estimate,
-            submitted_at=self._clock(),
+            submitted_at=now,
             profile_key=profile_key,
+            memory_hint=memory_gb,
+            vram_hint=vram_gb,
+            estimate_sample_count=profile.sample_count,
+            estimate_refreshed_at=now,
+            estimate_floor_gb=profile.memory_floor_gb,
         )
 
         with self.lock:
@@ -291,6 +319,12 @@ class AdaptiveExecutor:
         with self.lock:
             if not self.pending:
                 return
+
+            # Refresh each waiting task's estimate from the (possibly sharpened)
+            # profile BEFORE the infeasibility sweep, so the sweep and the
+            # scheduler both see current numbers. A task queued behind a long
+            # backlog thus benefits from its siblings' completed observations.
+            self._reestimate_pending(self._clock())
 
             # Fail any queued task whose estimate can never fit (e.g. crash-
             # retry penalization doubled it past capacity). Backfill would
@@ -370,6 +404,56 @@ class AdaptiveExecutor:
                 self.pending = deque(
                     p for p in self.pending if p.item.id not in removed
                 )
+
+    def _reestimate_pending(self, now: float) -> None:
+        """Refresh queued tasks' estimates from the current profile so a task
+        waiting in a long queue benefits from sibling completions.
+
+        Must hold ``self.lock``. Guarantees:
+          * User hints keep overriding: the original ``memory_hint`` / ``vram_hint``
+            captured at submit are re-passed to ``estimate()`` every refresh.
+          * A crash penalty is never weakened: entries with ``retry_count > 0``
+            keep their doubled estimate and exclusive flag (skipped entirely).
+          * Throttled: skips an entry refreshed within
+            ``_reestimate_interval_seconds`` (avoids re-copying the profile under
+            lock on every 10ms tick); once past the interval, only recomputes
+            when the profile's ``sample_count`` actually changed.
+        """
+        for pending in self.pending:
+            if pending.retry_count > 0:
+                continue
+            last = pending.estimate_refreshed_at
+            if last is not None and (now - last) < self._reestimate_interval_seconds:
+                continue
+            profile = self.profiles.get(
+                pending.item.fn_module, pending.item.fn_name, pending.profile_key
+            )
+            pending.estimate_refreshed_at = now
+            if (
+                profile.sample_count == pending.estimate_sample_count
+                and profile.memory_floor_gb == pending.estimate_floor_gb
+            ):
+                continue
+            new_estimate = profile.estimate(
+                memory_hint=pending.memory_hint, vram_hint=pending.vram_hint
+            )
+            if (
+                new_estimate.memory_gb != pending.estimate.memory_gb
+                or new_estimate.vram_gb != pending.estimate.vram_gb
+            ):
+                logger.debug(
+                    "re-estimate work_id=%s old_mem_gb=%.3f new_mem_gb=%.3f "
+                    "old_vram_gb=%.3f new_vram_gb=%.3f samples=%d",
+                    pending.item.id,
+                    pending.estimate.memory_gb,
+                    new_estimate.memory_gb,
+                    pending.estimate.vram_gb,
+                    new_estimate.vram_gb,
+                    profile.sample_count,
+                )
+            pending.estimate = new_estimate
+            pending.estimate_sample_count = profile.sample_count
+            pending.estimate_floor_gb = profile.memory_floor_gb
 
     def _infeasible_estimate(
         self,
@@ -462,20 +546,13 @@ class AdaptiveExecutor:
                 gpu_id=p.assigned_gpu_id,
                 remaining_seconds=self._running_remaining_seconds(p, now),
                 exclusive=p.exclusive,
+                profile_identity=p.profile_identity,
             )
             for p in self.in_flight.values()
         ]
 
         pending_entries = [
-            PendingEntry(
-                id=p.item.id,
-                memory_gb=p.estimate.memory_gb,
-                vram_gb=p.estimate.vram_gb,
-                cpu_cores=p.estimate.cpu_cores,
-                duration_p90_seconds=p.estimate.duration_p90_seconds,
-                exclusive=p.exclusive,
-            )
-            for p in self.pending
+            self._pending_entry(p) for p in self.pending
         ]
 
         capacity = Capacity(
@@ -489,6 +566,36 @@ class AdaptiveExecutor:
         )
 
         return plan_dispatch(pending_entries, running, capacity)
+
+    def _pending_entry(self, pending: PendingWork) -> PendingEntry:
+        """Build the scheduler's pending view, stamping the cold-start canary
+        identity/cold flag. Must hold ``self.lock``.
+
+        The identity is the ProfileStore key estimation actually drew from this
+        cycle (base or honored keyed bucket). It is stamped back onto the
+        ``PendingWork`` so, once dispatched, the running task reports the same
+        identity to the scheduler (a running canary others must wait behind).
+
+        A task is COLD when that identity has zero observations, EXCEPT when the
+        caller supplied a ``memory_gb`` / ``vram_gb`` hint: an explicit hint is
+        the caller asserting resource knowledge, so it bypasses the canary.
+        """
+        identity, sample_count = self.profiles.estimation_identity(
+            pending.item.fn_module, pending.item.fn_name, pending.profile_key
+        )
+        pending.profile_identity = identity
+        has_hint = pending.memory_hint is not None or pending.vram_hint is not None
+        cold = sample_count == 0 and not has_hint
+        return PendingEntry(
+            id=pending.item.id,
+            memory_gb=pending.estimate.memory_gb,
+            vram_gb=pending.estimate.vram_gb,
+            cpu_cores=pending.estimate.cpu_cores,
+            duration_p90_seconds=pending.estimate.duration_p90_seconds,
+            exclusive=pending.exclusive,
+            profile_identity=identity,
+            cold=cold,
+        )
 
     def _running_remaining_seconds(self, pending: PendingWork, now: float) -> float | None:
         """Expected seconds until ``pending`` releases its resources.
@@ -1065,6 +1172,32 @@ class AdaptiveExecutor:
         return exitcode in (-signal.SIGKILL, 137)
 
     def _penalize_estimate(self, pending: PendingWork):
+        # Persist an OOM memory floor into the profile BEFORE doubling: the
+        # estimate the task was admitted under was proven too small (the worker
+        # was SIGKILLed), yet the crash produced no observation, so without this
+        # the profile learns nothing and the next batch of fresh submits repeats
+        # the crash. The floor lower-bounds future estimates for this identity;
+        # it is written to the base profile and (when present) the keyed bucket.
+        # VRAM is intentionally not floored: an OOM/SIGKILL is a host-RAM event
+        # (the Linux OOM killer); VRAM exhaustion surfaces as an in-process CUDA
+        # error, not a SIGKILL, so it is not evidence a VRAM estimate was too low.
+        admitted_memory_gb = pending.estimate.memory_gb
+        logger.warning(
+            "crash floor set work_id=%s fn=%s:%s profile_key=%s memory_floor_gb=%.3f "
+            "retry_count=%d",
+            pending.item.id,
+            pending.item.fn_module,
+            pending.item.fn_name,
+            pending.profile_key,
+            admitted_memory_gb,
+            pending.retry_count,
+        )
+        self.profiles.record_memory_floor(
+            pending.item.fn_module,
+            pending.item.fn_name,
+            admitted_memory_gb,
+            profile_key=pending.profile_key,
+        )
         pending.estimate = ResourceEstimate(
             memory_gb=max(0.1, pending.estimate.memory_gb * 2.0),
             vram_gb=max(0.0, pending.estimate.vram_gb * 2.0),

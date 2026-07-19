@@ -54,7 +54,12 @@ Overview:
         profile at ``module:qualname#profile_key``. Every observation is
         recorded into both the base and (when given) the keyed profile;
         estimation prefers the keyed profile once it has any observation and
-        otherwise falls back to the base aggregate.
+        otherwise falls back to the base aggregate. A LearnedProfile also
+        carries a persistent memory_floor_gb learned from OOM/SIGKILL crashes
+        (lower-bounds estimate() after the safety margin, ratchets up, clears
+        via a recovery rule); the store exposes estimation_identity (the
+        identity + sample_count the cold-start canary keys off) and
+        record_memory_floor (dual base+keyed floor write).
     resolve:
       module: adaptive_executor/resolve.py
       role: >
@@ -85,7 +90,10 @@ Overview:
     computes a ResourceEstimate (p90 memory/VRAM/CPU plus a p90 run duration). It then checks feasibility against known capacity (total minus
     headroom) and raises InfeasibleTaskError synchronously if the estimate can
     never fit, so an impossible task fails at the call site instead of silently
-    queuing forever. A background dispatch thread first re-checks feasibility
+    queuing forever. A background dispatch thread first re-estimates each pending
+    task from the (possibly sharpened) profile so a task waiting behind a backlog
+    benefits from its siblings' completed observations — keeping user hints
+    overriding and never weakening a crash penalty. It then re-checks feasibility
     across the pending queue (an estimate can become infeasible after
     crash-retry penalization doubles it) and sets InfeasibleTaskError on any
     such task's future without killing the thread. It then gathers live state
@@ -100,7 +108,12 @@ Overview:
     ordered set of dispatch decisions (which pending tasks to start now and on
     which GPU): front tasks are admitted in strict FIFO order while they fit,
     and when the head is blocked, later tasks may backfill only if they cannot
-    delay the head's reservation. For each decision the executor obtains an idle
+    delay the head's reservation. A cold-start canary clamps first-contact
+    bursts: while a profile identity has zero observations, at most one task of
+    that identity may run at a time (hints and warm profiles bypass it), so N
+    identical first submits are not admitted together into a mass OOM — the
+    first completion warms the profile and the queued siblings unclamp with a
+    learned estimate. For each decision the executor obtains an idle
     worker pinned to the required GPU (spawning or evicting+replacing as
     necessary) and — immediately before shipping — runs the future's
     set_running_or_notify_cancel() handshake: a queued task the caller cancelled
@@ -117,14 +130,20 @@ Overview:
     (timeout kill, eviction) can only wedge that worker's own queue, which is
     poisoned and discarded, never a queue shared with other workers. Gracefully
     retired and crashed workers have their queue drained after exit (so no final
-    result is lost) then discarded. Workers are recycled after a configurable
-    number of tasks and reaped without leaving zombies.
+    result is lost) then discarded. When a worker is SIGKILLed under memory
+    pressure (OOM), the crash-retry path records a persistent memory floor into
+    the profile (base and keyed) — the estimate proven too small — so the next
+    batch of fresh submits is lower-bounded and does not repeat the crash, even
+    though the crashing run itself reported no observation. Workers are recycled
+    after a configurable number of tasks and reaped without leaving zombies.
 
 Features Index:
   executor:
     description: >
       Resource-aware submission, admission control, worker-pool management,
-      resource learning, and persistence.
+      resource learning, and persistence. Closes the learning loop with
+      dispatch-time re-estimation, a cold-start canary, and persistent crash
+      (OOM) memory floors.
     entry_points:
       - adaptive_executor.AdaptiveExecutor.submit
       - adaptive_executor.AdaptiveExecutor.shutdown
@@ -145,7 +164,9 @@ Features Index:
       head's resource reservation. Preserves the "never later than FIFO"
       invariant and per-GPU VRAM accounting. Exclusive tasks run alone start to
       finish: an exclusive head blocks all backfill, and a running exclusive
-      task blocks all dispatch until it leaves the in-flight set.
+      task blocks all dispatch until it leaves the in-flight set. A cold-start
+      canary additionally allows at most one task per cold profile identity to
+      run at a time (front admission and backfill).
     entry_points:
       - adaptive_executor.scheduling.plan_dispatch
       - adaptive_executor.AdaptiveExecutor._build_dispatch_plan

@@ -9,6 +9,9 @@ A resource-aware parallel executor for Python that learns from resource usage pa
 - **GPU Support**: Round-robin GPU assignment with VRAM tracking (requires `nvidia-ml-py`)
 - **Profile Persistence**: Save and load learned profiles across runs
 - **OOM Prevention**: Maintains configurable memory headroom to prevent out-of-memory crashes
+- **Closed Learning Loop**: Dispatch-time re-estimation of queued tasks, a
+  cold-start canary for first-contact workloads, and persistent crash (OOM)
+  memory floors — so what the executor learns feeds straight back into admission
 
 ## Installation
 
@@ -76,6 +79,55 @@ would under strict FIFO. Reservations respect per-GPU VRAM, and an exclusive
 task (used by OOM-crash retries) at the front blocks all backfill. This is the
 default and only behavior; there is no flag. See
 `docs/features/backfill-scheduling.md`.
+
+### Cold-start canary
+
+The first time you submit a function the executor has **no profile** for it, so
+every one of N simultaneous first submits gets the *same* default estimate and,
+without protection, they would all be admitted together — a mass first-contact
+OOM, exactly the failure this library exists to prevent.
+
+The cold-start canary prevents that: while a function's estimation profile is
+**cold** (zero observations), at most **one** task of that profile identity runs
+at a time. The first task is the canary; its siblings wait. When it completes it
+records an observation, the profile is no longer cold, and (thanks to
+dispatch-time re-estimation) the queued siblings automatically unclamp with a
+*learned* estimate. A cold-blocked task never stalls unrelated feasible work —
+other functions and disjoint tasks continue to backfill past it.
+
+The identity is per profile bucket: with `profile_key`, each keyed bucket gets
+its own canary; a keyed submit that falls back to a base profile that already
+has observations is not cold. Passing an explicit `memory_gb` / `vram_gb` hint
+**bypasses** the canary entirely — the hint is you asserting you already know the
+resource cost, so no first-contact protection is needed.
+
+### Dispatch-time re-estimation
+
+A task's estimate is not frozen at submit. On every dispatch cycle the executor
+refreshes each queued task's estimate from the current profile, so a task
+waiting behind a long backlog benefits from the profile sharpening as its
+siblings complete. User hints keep overriding the learned value, and a
+crash-penalized retry (whose estimate was deliberately doubled) is never
+weakened.
+
+### Crash floors (persistent OOM knowledge)
+
+When a worker is SIGKILLed under memory pressure (an OOM), the crashing run
+reports **no** observation — the worker died before it could measure anything —
+so naively the profile learns nothing and the *next* batch of submits repeats
+the same crash. To stop that, a crash records a persistent **memory floor** into
+the profile: the estimate the task was admitted under, now proven too small.
+
+- The floor **lower-bounds** future memory estimates for that function
+  (`max(computed_estimate, floor)`), applied after the safety margin.
+- It is written to both the base profile and, if the crash happened under a
+  `profile_key`, that keyed bucket.
+- It only **ratchets up** while active, and it is **cleared** once the workload
+  demonstrably shrinks — after five consecutive successful runs whose peak
+  memory is below half the floor — so a fixed workload is not penalized forever.
+- Floors persist across restarts. Only host RAM is floored: an OOM/SIGKILL is a
+  host-memory event; VRAM exhaustion surfaces as an in-process CUDA error rather
+  than a SIGKILL, so it is not treated as evidence a VRAM estimate was too low.
 
 ### Profile persistence
 
@@ -228,6 +280,7 @@ Semantics:
 4. **Backfill Scheduling**: When the head of the queue is blocked, later tasks may run ahead if they cannot delay the head's resource reservation (per-GPU aware)
 5. **Execution**: Workers execute tasks and measure actual resource usage
 6. **Learning**: Observations (including run duration) are recorded and used to improve future estimates
+7. **Closing the loop**: Queued tasks are re-estimated as the profile sharpens, a cold-start canary gates first-contact bursts, and OOM crashes record a persistent memory floor so the next batch does not repeat the crash
 
 ## Requirements
 
