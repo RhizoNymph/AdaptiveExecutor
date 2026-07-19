@@ -166,6 +166,33 @@ def oom_exhausted_workload() -> Workload:
     return Workload(capacity=cap, tasks=tasks, max_workers=2, label="oom_exhausted")
 
 
+def oom_storm_workload() -> Workload:
+    """An OOM-retry storm on a 2-worker machine.
+
+    Two flaky tasks each OOM-crash once; the executor's real crash-retry path
+    penalizes (doubles) their estimate and marks the retry *exclusive*. A
+    backlog of short CPU fillers keeps the queue non-empty so that -- without
+    run-isolation -- a filler would dispatch alongside a running exclusive task
+    as soon as a worker slot frees mid-run. The property test asserts that never
+    happens: an exclusive task runs alone for its whole run.
+    """
+    cap = SimCapacity(memory_total_gb=32.0, memory_baseline_used_gb=8.0)  # usable 22
+    flaky_a = TaskSpec(
+        "flaky-a", task_stubs.flaky, duration=3.0, actual_memory_gb=2.0,
+        est_memory_gb=2.0, outcome="oom", oom_crashes=1,
+    )
+    flaky_b = TaskSpec(
+        "flaky-b", task_stubs.flaky, duration=3.0, actual_memory_gb=2.0,
+        est_memory_gb=2.0, outcome="oom", oom_crashes=1,
+    )
+    fillers = [
+        TaskSpec(f"fill-{i}", task_stubs.work, duration=2.0, actual_memory_gb=2.0, est_memory_gb=2.0)
+        for i in range(5)
+    ]
+    tasks = (flaky_a, fillers[0], fillers[1], flaky_b, fillers[2], fillers[3], fillers[4])
+    return Workload(capacity=cap, tasks=tasks, max_workers=2, label="oom_storm")
+
+
 def gpu_roundrobin_workload() -> Workload:
     """VRAM tasks across two GPUs to exercise per-GPU committed accounting."""
     cap = SimCapacity(
