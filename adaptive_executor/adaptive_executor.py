@@ -1,4 +1,5 @@
 import logging
+import math
 import multiprocessing as mp
 import os
 import signal
@@ -15,6 +16,12 @@ from .dtypes import ResourceEstimate, WorkItem, WorkResult
 from .monitor import ResourceMonitor
 from .profiles import ProfileStore
 from .resolve import validate_submittable
+from .scheduling import (
+    Capacity,
+    PendingEntry,
+    RunningEntry,
+    plan_dispatch,
+)
 from .worker import worker_process_entry
 
 logger = logging.getLogger("adaptive_executor")
@@ -203,81 +210,126 @@ class AdaptiveExecutor:
 
     def _maybe_dispatch(self):
         with self.lock:
-            while self.pending:
-                pending = self.pending[0]
-                can_admit, gpu_id = self._can_admit(pending)
-                if not can_admit:
-                    break
+            if not self.pending:
+                return
 
-                worker = self._get_or_spawn_idle_worker(gpu_id)
+            plan = self._build_dispatch_plan()
+            self._next_gpu_index = plan.next_gpu_index
+            if not plan.decisions:
+                return
+
+            by_id = {p.item.id: p for p in self.pending}
+            dispatched: set[str] = set()
+            for decision in plan.decisions:
+                pending = by_id.get(decision.pending_id)
+                if pending is None:
+                    continue
+                worker = self._get_or_spawn_idle_worker(decision.gpu_id)
                 if worker is None:
-                    break
+                    # No worker available right now; leave the task queued. This
+                    # never delays the head below FIFO — a worker shortage would
+                    # stall FIFO identically.
+                    continue
 
-                self.pending.popleft()
-                pending.assigned_gpu_id = gpu_id
+                pending.assigned_gpu_id = decision.gpu_id
                 pending.worker_id = worker.worker_id
                 pending.started_at = time.time()
                 self.in_flight[pending.item.id] = pending
                 worker.current_work_id = pending.item.id
-                worker.work_queue.put(replace(pending.item, gpu_id=gpu_id))
+                worker.work_queue.put(replace(pending.item, gpu_id=decision.gpu_id))
+                dispatched.add(pending.item.id)
 
-    def _can_admit(self, pending: PendingWork) -> tuple[bool, int | None]:
-        estimate = pending.estimate
+            if dispatched:
+                self.pending = deque(
+                    p for p in self.pending if p.item.id not in dispatched
+                )
+
+    def _build_dispatch_plan(self):
+        """Gather live state and delegate the scheduling decision to the pure
+        reservation-based backfill scheduler in :mod:`adaptive_executor.scheduling`.
+        """
         snapshot = self.monitor.current
-
-        workers_ok = len(self.in_flight) < self.max_workers
-        if pending.exclusive and self.in_flight:
-            return False, None
-        if not workers_ok:
-            return False, None
+        now = time.time()
+        committed = self._committed_resources()
+        committed_vram = self._committed_vram_per_gpu()
+        gpu_ids = self.gpu_ids or []
 
         if snapshot is None:
-            if estimate.vram_gb > 0 and self.gpu_ids:
-                gpu_id = self._pick_round_robin_gpu(None, estimate)
-                return gpu_id is not None, gpu_id
-            return True, None
+            # No snapshot yet: memory/VRAM are not gating (treated as infinite),
+            # matching the prior startup admission behavior.
+            memory_free = math.inf
+            gpu_free: dict[int, float] = {g: math.inf for g in gpu_ids}
+            snapshot_present = False
+        else:
+            memory_free = (
+                snapshot.memory_total_gb
+                - snapshot.memory_used_gb
+                - self.memory_headroom_gb
+                - committed.memory_gb
+            )
+            gpu_free = {}
+            for g in gpu_ids:
+                gpu = snapshot.gpus.get(g)
+                if gpu is None:
+                    continue
+                gpu_free[g] = (
+                    gpu.vram_total_gb
+                    - gpu.vram_used_gb
+                    - self.vram_headroom_gb
+                    - committed_vram.get(g, 0.0)
+                )
+            snapshot_present = True
 
-        committed = self._committed_resources()
-        available_memory = snapshot.memory_total_gb - snapshot.memory_used_gb - self.memory_headroom_gb
-        memory_ok = committed.memory_gb + estimate.memory_gb < available_memory
-        if not memory_ok:
-            return False, None
+        running = [
+            RunningEntry(
+                id=p.item.id,
+                memory_gb=p.estimate.memory_gb,
+                vram_gb=p.estimate.vram_gb,
+                gpu_id=p.assigned_gpu_id,
+                remaining_seconds=self._running_remaining_seconds(p, now),
+            )
+            for p in self.in_flight.values()
+        ]
 
-        assigned_gpu = None
-        if estimate.vram_gb > 0:
-            assigned_gpu = self._pick_round_robin_gpu(snapshot, estimate)
-            if assigned_gpu is None:
-                return False, None
+        pending_entries = [
+            PendingEntry(
+                id=p.item.id,
+                memory_gb=p.estimate.memory_gb,
+                vram_gb=p.estimate.vram_gb,
+                cpu_cores=p.estimate.cpu_cores,
+                duration_p90_seconds=p.estimate.duration_p90_seconds,
+                exclusive=p.exclusive,
+            )
+            for p in self.pending
+        ]
 
-        effective_max = self.max_workers
-        if estimate.cpu_cores > 1:
-            effective_max = max(1, int(self.max_workers / estimate.cpu_cores))
+        capacity = Capacity(
+            memory_free_gb=memory_free,
+            gpu_free_vram_gb=gpu_free,
+            gpu_round_robin=tuple(gpu_ids),
+            next_gpu_index=self._next_gpu_index,
+            max_workers=self.max_workers,
+            running_count=len(self.in_flight),
+            snapshot_present=snapshot_present,
+        )
 
-        return len(self.in_flight) < effective_max, assigned_gpu
+        return plan_dispatch(pending_entries, running, capacity)
 
-    def _pick_round_robin_gpu(self, snapshot, estimate: ResourceEstimate) -> int | None:
-        if not self.gpu_ids:
+    def _running_remaining_seconds(self, pending: PendingWork, now: float) -> float | None:
+        """Expected seconds until ``pending`` releases its resources.
+
+        Returns None (unknown, assumed never to release) when the function has no
+        learned duration, when the task has not started, or when it has already
+        overrun its estimate — the last case makes the head's reservation slip,
+        degrading toward FIFO rather than below it.
+        """
+        expected = pending.estimate.duration_p90_seconds
+        if expected is None or pending.started_at is None:
             return None
-
-        committed_per_gpu = self._committed_vram_per_gpu()
-        num_gpus = len(self.gpu_ids)
-
-        for offset in range(num_gpus):
-            gpu_idx = (self._next_gpu_index + offset) % num_gpus
-            gpu_id = self.gpu_ids[gpu_idx]
-
-            if snapshot is not None:
-                if gpu_id not in snapshot.gpus:
-                    continue
-                gpu = snapshot.gpus[gpu_id]
-                available = gpu.vram_total_gb - gpu.vram_used_gb - self.vram_headroom_gb
-                if committed_per_gpu.get(gpu_id, 0.0) + estimate.vram_gb >= available:
-                    continue
-
-            self._next_gpu_index = (gpu_idx + 1) % num_gpus
-            return gpu_id
-
-        return None
+        elapsed = now - pending.started_at
+        if elapsed >= expected:
+            return None
+        return expected - elapsed
 
     def _committed_resources(self) -> ResourceEstimate:
         return ResourceEstimate(

@@ -27,16 +27,27 @@
      `ResourceEstimate` (p90 + confidence-scaled safety margin, or hints).
    - Appends `PendingWork` to `self.pending`.
 2. **_dispatch_loop** (thread): `_check_workers()` then `_maybe_dispatch()`.
-   - `_can_admit(pending)`: caps in-flight to `max_workers`, enforces memory
-     headroom against committed in-flight estimates, picks a GPU via
-     `_pick_round_robin_gpu` when `vram_gb > 0`, and applies a cpu-cores derived
-     effective max.
+   - `_maybe_dispatch()` gathers live state via `_build_dispatch_plan()` and
+     calls the pure `scheduling.plan_dispatch()` (reservation-based backfill).
+     `_build_dispatch_plan()` computes admittable memory (snapshot memory minus
+     used, headroom, and committed in-flight estimates), per-GPU admittable VRAM
+     (via `_committed_vram_per_gpu`), and each running task's remaining time
+     (via `_running_remaining_seconds`, from `duration_p90_seconds` vs elapsed).
+     When no monitor snapshot exists yet, memory/VRAM are treated as infinite
+     (non-gating). The scheduler returns an ordered list of `DispatchDecision`
+     (pending id + GPU); the executor executes them, updating `_next_gpu_index`.
+     Full semantics are in `docs/features/backfill-scheduling.md`. Admission
+     arithmetic (memory headroom against committed estimates, cpu-cores derived
+     effective max, per-GPU round-robin VRAM fit) now lives inside the pure
+     scheduler.
    - `_get_or_spawn_idle_worker(gpu_id)`:
      - reuse an alive idle worker with matching pin; else
      - if below cap, spawn a worker pinned to `gpu_id`; else
      - at the cap, evict one idle mismatched worker (`_retire_worker`) and spawn
        a replacement; else (all busy) return `None` (backpressure).
    - On success: move to `in_flight`, mark worker busy, send the `WorkItem`.
+     Dispatched ids are removed from `self.pending` (which may be non-contiguous
+     when tasks backfilled past a blocked head).
 3. **worker** (subprocess): resolves fn via shared `resolve_function`, runs it,
    samples RSS and (only when pinned) pinned-GPU VRAM, returns a `WorkResult`.
 4. **_collect_results** (thread): clears the worker's `current_work_id`,
@@ -53,8 +64,11 @@
 - `adaptive_executor/adaptive_executor.py` — `AdaptiveExecutor`, `WorkerSlot`
   (adds `tasks_completed`), `PendingWork`. Key methods:
   `_get_or_spawn_idle_worker`, `_find_idle_evictable_worker`, `_retire_worker`,
-  `_should_recycle`, `_check_workers` (reaps `_retiring`), `_can_admit`,
-  `_collect_results`.
+  `_should_recycle`, `_check_workers` (reaps `_retiring`), `_maybe_dispatch`,
+  `_build_dispatch_plan`, `_running_remaining_seconds`, `_committed_resources`,
+  `_committed_vram_per_gpu`, `_collect_results`.
+- `adaptive_executor/scheduling.py` — pure reservation-based backfill scheduler
+  (`plan_dispatch`); see `docs/features/backfill-scheduling.md`.
 - `adaptive_executor/worker.py` — `Worker`, `worker_process_entry`. Key:
   `_gpu_vram_gb` (pinned-only, per-process preferred), `_process_tree_pids`,
   `_execute_with_observation`.
