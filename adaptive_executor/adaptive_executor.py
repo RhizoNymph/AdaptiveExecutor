@@ -40,6 +40,11 @@ class PendingWork:
     retry_count: int = 0
     exclusive: bool = False
     result_ignored: bool = False
+    # Optional caller-supplied bucket for input-aware profiling. Travels with the
+    # task (parent-side only; workers never see it) so result recording writes to
+    # the same keyed profile the estimate was drawn from. Survives crash-retry
+    # re-queuing because the PendingWork object is reused.
+    profile_key: str | None = None
 
 
 @dataclass
@@ -159,6 +164,7 @@ class AdaptiveExecutor:
         *args,
         memory_gb: float | None = None,
         vram_gb: float | None = None,
+        profile_key: str | None = None,
         **kwargs,
     ) -> Future:
         """
@@ -169,6 +175,12 @@ class AdaptiveExecutor:
             *args: Positional arguments
             memory_gb: Optional hint for expected RAM usage
             vram_gb: Optional hint for expected VRAM usage
+            profile_key: Optional opaque string bucketing inputs by expected
+                resource usage (e.g. "small"/"large", a resolution, a file-size
+                band). Observations are learned per bucket so an input-sensitive
+                function does not merge a small and a huge input into one
+                distribution. When the bucket has no history yet, estimation
+                falls back to the function's aggregate profile.
             **kwargs: Keyword arguments
 
         Returns:
@@ -193,7 +205,7 @@ class AdaptiveExecutor:
             gpu_id=None,
         )
 
-        profile = self.profiles.get(item.fn_module, item.fn_name)
+        profile = self.profiles.get(item.fn_module, item.fn_name, profile_key)
         estimate = profile.estimate(memory_hint=memory_gb, vram_hint=vram_gb)
 
         # Reject a task that can never fit on this machine before it ever enters
@@ -211,6 +223,7 @@ class AdaptiveExecutor:
             future=future,
             estimate=estimate,
             submitted_at=self._clock(),
+            profile_key=profile_key,
         )
 
         with self.lock:
@@ -548,6 +561,7 @@ class AdaptiveExecutor:
             pending.item.fn_module,
             pending.item.fn_name,
             result.observation,
+            profile_key=pending.profile_key,
         )
 
         if result.success:
