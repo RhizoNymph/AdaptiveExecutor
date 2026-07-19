@@ -102,10 +102,16 @@ Overview:
     and when the head is blocked, later tasks may backfill only if they cannot
     delay the head's reservation. For each decision the executor obtains an idle
     worker pinned to the required GPU (spawning or evicting+replacing as
-    necessary) and sends the WorkItem over that worker's queue. The worker
+    necessary) and — immediately before shipping — runs the future's
+    set_running_or_notify_cancel() handshake: a queued task the caller cancelled
+    is dropped here and never dispatched, while a task that clears the handshake
+    is now RUNNING and can no longer be cancelled. It then sends the WorkItem
+    over that worker's queue. The worker
     executes, measures usage, and returns a WorkResult on the shared result
-    queue. A result thread resolves the future and records the
-    ResourceObservation (including duration_seconds) into the ProfileStore under
+    queue. A result thread resolves the future (via cancellation-safe settling
+    that drops a result whose future is already done rather than raising) and
+    records the ResourceObservation (including duration_seconds) into the
+    ProfileStore under
     both the base and (when the task carried a profile_key) the keyed profile,
     which persists to disk in a debounced fashion. Workers are recycled after a
     configurable number of tasks and reaped without leaving zombies.

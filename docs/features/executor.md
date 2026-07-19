@@ -11,6 +11,8 @@
 - Per-run resource measurement (RSS/VRAM/CPU) and learning.
 - Debounced, atomic profile persistence with flush-on-shutdown.
 - Timeout handling and resource-crash retry.
+- Future cancellation: queued tasks are cancellable via the standard
+  `concurrent.futures.Future.cancel()`; running tasks are not.
 
 ## Non-scope
 - Real GPU/NVML behavior is not exercised by tests (no GPU on CI); GPU paths are
@@ -91,9 +93,30 @@
      - if below cap, spawn a worker pinned to `gpu_id`; else
      - at the cap, evict one idle mismatched worker (`_retire_worker`) and spawn
        a replacement; else (all busy) return `None` (backpressure).
+   - **Running handshake / cancellation.** Once a worker is secured and
+     immediately before shipping, the executor calls the future's
+     `set_running_or_notify_cancel()` (exactly once per future — tracked by
+     `PendingWork.running_notified`, since a crash-retry re-queues an already-
+     RUNNING future). If it returns `False` the caller had cancelled the queued
+     task: it is dropped from `self.pending` and recorded in
+     `completed_or_abandoned`, never dispatched, and no worker state is touched
+     (the secured worker stays idle for the next decision). If it returns `True`
+     the future is now `RUNNING`, so `cancel()` returns `False` from here on and
+     the in-flight accounting can never be cancelled out from under the
+     executor. This is the atomic queued/running boundary: a `cancel()` racing
+     dispatch has exactly one winner.
    - On success: move to `in_flight`, mark worker busy, send the `WorkItem`.
-     Dispatched ids are removed from `self.pending` (which may be non-contiguous
-     when tasks backfilled past a blocked head).
+     Dispatched ids (and cancelled ones) are removed from `self.pending` (which
+     may be non-contiguous when tasks backfilled past a blocked head).
+   - **Cancellation-safe future settling.** Every `set_result`/`set_exception`
+     site routes through `_settle_future_result` / `_settle_future_exception`,
+     which skip a future that is already `done()` (cancelled or resolved by
+     timeout/crash) and, for the narrow race where a caller cancels between the
+     `done()` check and the set, catch `InvalidStateError` with a structured
+     log. A done/cancelled future can therefore never raise `InvalidStateError`
+     into a background thread. The infeasibility sweep and `_fail_pending_futures`
+     skip cancelled entries the same way (dropping them as abandoned rather than
+     stuffing an exception into a cancelled future).
 3. **worker** (subprocess): resolves fn via shared `resolve_function`, runs it,
    samples RSS and (only when pinned) pinned-GPU VRAM, returns a `WorkResult`.
 4. **_collect_results** (thread): clears the worker's `current_work_id`,
@@ -118,7 +141,10 @@
   `_infeasible_estimate`, `_build_dispatch_plan`, `_running_remaining_seconds`,
   `_committed_resources`, `_committed_vram_per_gpu`, `_capture_baseline`,
   `_refresh_observations`, `_update_observed`, `_sample_rss_bytes`,
-  `_sample_process_vram_gb`, `_worker_process_pids`, `_collect_results`.
+  `_sample_process_vram_gb`, `_worker_process_pids`, `_collect_results`,
+  `_settle_future_result`, `_settle_future_exception` (cancellation-safe future
+  settling). `PendingWork` also carries `running_notified` (the once-only
+  running-handshake flag).
   `PendingWork` also carries observed-usage fields (`worker_pid`,
   `rss_baseline_bytes`, `vram_baseline_gb`, `observed_memory_gb`,
   `observed_vram_gb`, `observed_refreshed_at`).
@@ -172,6 +198,18 @@
   unreadable. A finishing task is projected to release only its committed
   remainder to the reservation (never the already-realized portion), keeping the
   head's reservation conservative.
+- Cancellation is a queued-only operation. A future in `self.pending` is always
+  `PENDING` or `CANCELLED` (never yet handed to a worker), so the dispatch-time
+  `set_running_or_notify_cancel()` handshake can safely decide between them. Once
+  a task is dispatched its future is `RUNNING` and `cancel()` returns `False`;
+  crash-retry re-queues an already-`RUNNING` future, so the handshake runs at
+  most once per future (`running_notified`) and a retrying task is likewise not
+  cancellable. A cancelled task frees its queue slot, is recorded in
+  `completed_or_abandoned`, and is never executed nor given a result/exception.
+- No `set_result`/`set_exception` on a done/cancelled future may reach a bare
+  call: all sites go through `_settle_future_*`, which guard with `done()` plus a
+  narrow `InvalidStateError` catch, so a background thread can never die from
+  resolving a future the caller already cancelled or that was already resolved.
 - Only an idle worker (`current_work_id is None`, alive, not
   `intentionally_stopped`) may be reused, evicted, or recycled.
 - VRAM is attributed to the worker's pinned device only; an unpinned worker
