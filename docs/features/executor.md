@@ -25,8 +25,20 @@
    - Builds a `WorkItem(module, qualname, args, kwargs)`.
    - `ProfileStore.get` returns a snapshot `LearnedProfile`; `estimate()` yields a
      `ResourceEstimate` (p90 + confidence-scaled safety margin, or hints).
+   - `_infeasible_estimate(estimate, snapshot, retry_count=0)` against a snapshot
+     (`monitor.current` or a direct `monitor.snapshot()` if not yet populated):
+     if the estimate exceeds total capacity minus headroom (`memory_gb >
+     memory_total_gb - memory_headroom_gb`, or `vram_gb > largest GPU
+     vram_total_gb - vram_headroom_gb`), raise `InfeasibleTaskError` synchronously.
+     Only declared when capacity is known (snapshot present with positive memory
+     total; for VRAM, snapshot GPUs present). Unknown capacity -> not declared.
    - Appends `PendingWork` to `self.pending`.
 2. **_dispatch_loop** (thread): `_check_workers()` then `_maybe_dispatch()`.
+   - `_infeasible_estimate(head.estimate, monitor.current, head.retry_count)`:
+     if the head task is now infeasible (e.g. crash-retry penalization doubled
+     its estimate past capacity), pop it, set `InfeasibleTaskError` on its future
+     (with `retry_count` context), record it abandoned, and `continue` to the
+     next pending task. The dispatch thread never raises/dies from this.
    - `_can_admit(pending)`: caps in-flight to `max_workers`, enforces memory
      headroom against committed in-flight estimates, picks a GPU via
      `_pick_round_robin_gpu` when `vram_gb > 0`, and applies a cpu-cores derived
@@ -53,8 +65,10 @@
 - `adaptive_executor/adaptive_executor.py` — `AdaptiveExecutor`, `WorkerSlot`
   (adds `tasks_completed`), `PendingWork`. Key methods:
   `_get_or_spawn_idle_worker`, `_find_idle_evictable_worker`, `_retire_worker`,
-  `_should_recycle`, `_check_workers` (reaps `_retiring`), `_can_admit`,
-  `_collect_results`.
+  `_should_recycle`, `_check_workers` (reaps `_retiring`), `_infeasible_estimate`,
+  `_can_admit`, `_collect_results`.
+- `adaptive_executor/errors.py` — `InfeasibleTaskError` (structured fields:
+  `kind` in {"memory","vram"}, `estimate_gb`, `capacity_gb`, `retry_count`).
 - `adaptive_executor/worker.py` — `Worker`, `worker_process_entry`. Key:
   `_gpu_vram_gb` (pinned-only, per-process preferred), `_process_tree_pids`,
   `_execute_with_observation`.
@@ -69,6 +83,12 @@
 - `adaptive_executor/dtypes.py` — dataclasses.
 
 ## Invariants and constraints
+- Infeasibility is a permanent condition (estimate > total capacity minus
+  headroom), distinct from "doesn't fit right now" (normal queuing/backpressure).
+  It is only ever declared when capacity is known; unknown capacity leaves
+  admission behavior unchanged. It is raised synchronously from `submit()` and
+  attached to the future (never raised) in the dispatch thread, which keeps
+  running and moves on to the next pending task.
 - A `WorkerSlot` in `self.workers` is alive or about to be reaped by
   `_check_workers`; retired workers live only in `self._retiring` until joined.
 - Workers are pinned to one GPU (NVML index) for their lifetime; a pin change
