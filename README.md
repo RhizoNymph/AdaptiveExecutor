@@ -22,7 +22,7 @@ pip install -e ".[gpu]"
 ## Testing
 
 ```bash
-python3 test_executor.py
+uv run --group dev pytest
 ```
 
 ## Quick Start
@@ -45,14 +45,40 @@ with AdaptiveExecutor(max_workers=8, memory_headroom_gb=2.0) as executor:
 
 ```python
 executor = AdaptiveExecutor(
-    max_workers=8,              # Maximum concurrent workers
-    gpu_ids=[0, 1],             # GPUs to use (None = auto-detect)
-    profile_path="profiles.json",  # Persist learned profiles
-    memory_headroom_gb=2.0,     # RAM to keep free
-    vram_headroom_gb=1.0,       # VRAM to keep free per GPU
-    task_timeout_seconds=300.0, # Task timeout
+    max_workers=8,               # Maximum concurrent workers
+    gpu_ids=[0, 1],              # GPUs to use (None = auto-detect)
+    profile_path="profiles.json",   # Persist learned profiles
+    memory_headroom_gb=2.0,      # RAM to keep free
+    vram_headroom_gb=1.0,        # VRAM to keep free per GPU
+    task_timeout_seconds=300.0,  # Task timeout
+    worker_recycle_after_tasks=50,  # Retire+respawn a worker after N tasks (None disables)
 )
 ```
+
+### Worker recycling
+
+`worker_recycle_after_tasks` (default `50`) retires a worker once it has
+completed that many tasks and spawns a fresh one on demand. CPython rarely
+returns freed memory to the OS, so a long-lived worker's RSS baseline ratchets
+upward; recycling keeps memory observations accurate. Pass `None` to disable.
+
+### Profile persistence
+
+When `profile_path` is set, learned profiles are persisted with **debounced**
+writes: the store saves when either `save_every_n` observations (default `20`)
+have accumulated or `save_interval_seconds` (default `5.0`) have elapsed since
+the last save — whichever comes first. Writes are atomic (temp file +
+`os.replace`) and happen outside the store lock. `shutdown()` flushes any
+pending observations so nothing is lost on a clean exit.
+
+### Submitting functions
+
+Submitted callables must be importable in a worker subprocess by their module
+and qualified name. Lambdas, closures (functions defined inside other
+functions), and bound methods are rejected at submit time with a clear
+`ValueError`. For an instance method, submit the underlying function and pass
+the instance as the first argument, e.g. `executor.submit(Cls.method, instance,
+...)`.
 
 ## Resource Hints
 
