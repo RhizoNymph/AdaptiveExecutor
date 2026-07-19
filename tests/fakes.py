@@ -68,6 +68,34 @@ class FakeMonitor:
         return self._lookup(self.device, device_id)
 
 
+class StubSystemMonitor:
+    """Executor-side monitor stub returning a fixed ``ResourceSnapshot``.
+
+    Distinct from ``FakeMonitor`` (which stubs the worker VRAM API): this stands
+    in for ``ResourceMonitor`` where the executor reads ``current`` / ``snapshot``
+    for admission and feasibility checks. Pass ``snapshot=None`` to model unknown
+    capacity.
+    """
+
+    def __init__(self, snapshot=None):
+        self._snapshot = snapshot
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def snapshot(self):
+        return self._snapshot
+
+    @property
+    def current(self):
+        return self._snapshot
+
+
 class NVMLError(Exception):
     pass
 

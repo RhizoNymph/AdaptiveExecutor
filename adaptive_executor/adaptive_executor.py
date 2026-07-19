@@ -11,7 +11,8 @@ from dataclasses import dataclass, replace
 from queue import Empty
 from typing import Callable, Literal
 
-from .dtypes import ResourceEstimate, WorkItem, WorkResult
+from .dtypes import ResourceEstimate, ResourceSnapshot, WorkItem, WorkResult
+from .errors import InfeasibleTaskError
 from .monitor import ResourceMonitor
 from .profiles import ProfileStore
 from .resolve import validate_submittable
@@ -188,6 +189,15 @@ class AdaptiveExecutor:
         profile = self.profiles.get(item.fn_module, item.fn_name)
         estimate = profile.estimate(memory_hint=memory_gb, vram_hint=vram_gb)
 
+        # Reject a task that can never fit on this machine before it ever enters
+        # the queue, so it fails at the call site instead of silently blocking
+        # the FIFO head forever. The polled snapshot may not be populated yet
+        # right after auto-start, so take a direct reading in that case.
+        snapshot = self.monitor.current or self.monitor.snapshot()
+        infeasible = self._infeasible_estimate(estimate, snapshot, retry_count=0)
+        if infeasible is not None:
+            raise infeasible
+
         future = Future()
         pending = PendingWork(
             item=item,
@@ -211,6 +221,22 @@ class AdaptiveExecutor:
         with self.lock:
             while self.pending:
                 pending = self.pending[0]
+
+                # A head task whose estimate can never fit (e.g. crash-retry
+                # penalization doubled it past capacity) would otherwise block
+                # the whole FIFO forever. Fail only that task's future and move
+                # on; the dispatch thread itself must keep running.
+                infeasible = self._infeasible_estimate(
+                    pending.estimate,
+                    self.monitor.current,
+                    retry_count=pending.retry_count,
+                )
+                if infeasible is not None:
+                    self.pending.popleft()
+                    pending.future.set_exception(infeasible)
+                    self.completed_or_abandoned.add(pending.item.id)
+                    continue
+
                 can_admit, gpu_id = self._can_admit(pending)
                 if not can_admit:
                     break
@@ -226,6 +252,46 @@ class AdaptiveExecutor:
                 self.in_flight[pending.item.id] = pending
                 worker.current_work_id = pending.item.id
                 worker.work_queue.put(replace(pending.item, gpu_id=gpu_id))
+
+    def _infeasible_estimate(
+        self,
+        estimate: ResourceEstimate,
+        snapshot: ResourceSnapshot | None,
+        retry_count: int,
+    ) -> InfeasibleTaskError | None:
+        """Return an error if ``estimate`` can never fit, else ``None``.
+
+        Infeasibility means the estimate exceeds *total* capacity minus headroom
+        — a permanent condition, distinct from "doesn't fit right now" (normal
+        queuing). It is only declared when capacity is actually known: memory
+        needs a snapshot with a positive total; VRAM additionally needs GPU info.
+        When capacity is unknown, returns ``None`` so admission behaves as before.
+        """
+        if snapshot is None:
+            return None
+
+        if snapshot.memory_total_gb > 0:
+            memory_capacity = snapshot.memory_total_gb - self.memory_headroom_gb
+            if estimate.memory_gb > memory_capacity:
+                return InfeasibleTaskError(
+                    kind="memory",
+                    estimate_gb=estimate.memory_gb,
+                    capacity_gb=memory_capacity,
+                    retry_count=retry_count,
+                )
+
+        if estimate.vram_gb > 0 and snapshot.gpus:
+            largest_vram_total = max(g.vram_total_gb for g in snapshot.gpus.values())
+            vram_capacity = largest_vram_total - self.vram_headroom_gb
+            if estimate.vram_gb > vram_capacity:
+                return InfeasibleTaskError(
+                    kind="vram",
+                    estimate_gb=estimate.vram_gb,
+                    capacity_gb=vram_capacity,
+                    retry_count=retry_count,
+                )
+
+        return None
 
     def _can_admit(self, pending: PendingWork) -> tuple[bool, int | None]:
         estimate = pending.estimate
