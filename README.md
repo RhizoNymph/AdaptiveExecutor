@@ -80,6 +80,40 @@ functions), and bound methods are rejected at submit time with a clear
 the instance as the first argument, e.g. `executor.submit(Cls.method, instance,
 ...)`.
 
+### Infeasible tasks
+
+A task whose resource estimate can never fit on this machine — for example a
+64 GB RAM estimate on a 32 GB box, or a VRAM estimate larger than every GPU —
+would otherwise sit at the head of the FIFO queue forever, silently blocking
+every task behind it. The executor detects this and fails the task instead:
+
+- **At submit time**, `submit()` raises `InfeasibleTaskError` synchronously when
+  the estimate already exceeds total capacity minus headroom, so you can catch
+  it right at the call site.
+- **At dispatch time**, if an estimate becomes infeasible later (a task killed
+  under memory pressure has its estimate doubled by crash-retry penalization),
+  the affected task's future fails with `InfeasibleTaskError` while the executor
+  keeps running and moves on to the next task.
+
+Infeasibility means "exceeds total capacity" (a permanent condition), not
+"doesn't fit right now" (normal queuing). It is only declared when capacity is
+actually known from a monitor snapshot; if capacity is unknown, admission is
+unchanged.
+
+```python
+from adaptive_executor import AdaptiveExecutor, InfeasibleTaskError
+
+with AdaptiveExecutor() as executor:
+    try:
+        future = executor.submit(train, dataset, memory_gb=64.0)
+    except InfeasibleTaskError as err:
+        # Structured fields, not just a message:
+        print(err.kind)         # "memory" or "vram"
+        print(err.estimate_gb)  # what the task needs
+        print(err.capacity_gb)  # usable capacity it exceeded
+        print(err.retry_count)  # >0 if a crash-retry penalty caused it
+```
+
 ## Resource Hints
 
 You can provide hints if you know the resource requirements upfront:
