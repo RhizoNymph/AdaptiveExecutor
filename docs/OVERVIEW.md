@@ -44,27 +44,49 @@ Overview:
       role: >
         Shared (module, qualname) -> callable resolution used by both the worker
         and submit-time validation.
+    errors:
+      module: adaptive_executor/errors.py
+      role: >
+        Typed, structured executor exceptions. Currently InfeasibleTaskError,
+        raised/attached when a task's estimate can never fit on this machine
+        (carries kind, estimate_gb, capacity_gb, retry_count).
     dtypes:
       module: adaptive_executor/dtypes.py
       role: Dataclasses for snapshots, observations, estimates, work items/results.
+    scheduler_sim:
+      module: tests/sim/
+      role: >
+        Test-only deterministic discrete-event harness. Drives the executor's
+        real dispatch/admission methods (_maybe_dispatch, _can_admit,
+        _pick_round_robin_gpu, committed-resource accounting, _handle_dead_worker,
+        _process_result) against a virtual clock and synthetic workloads -- no
+        subprocesses, no NVML, no wall-clock sleeps -- and asserts scheduling
+        invariants over a recorded virtual-time trace. See
+        docs/features/scheduler-sim.md.
   data_flow: >
     submit() validates the callable is importable, looks up its LearnedProfile,
     and computes a ResourceEstimate (p90 memory/VRAM/CPU plus a p90 run
-    duration). A background dispatch thread gathers live state each cycle
-    (monitor snapshot, committed in-flight estimates, per-GPU VRAM, running
-    tasks' elapsed-vs-expected times) into the scheduling subsystem's input
-    dataclasses and calls plan_dispatch(). The scheduler returns an ordered set
-    of dispatch decisions (which pending tasks to start now and on which GPU):
-    front tasks are admitted in strict FIFO order while they fit, and when the
-    head is blocked, later tasks may backfill only if they cannot delay the
-    head's reservation. For each decision the executor obtains an idle worker
-    pinned to the required GPU (spawning or evicting+replacing as necessary) and
-    sends the WorkItem over that worker's queue. The worker executes, measures
-    usage, and returns a WorkResult on the shared result queue. A result thread
-    resolves the future and records the ResourceObservation (including
-    duration_seconds) into the ProfileStore, which persists to disk in a
-    debounced fashion. Workers are recycled after a configurable number of tasks
-    and reaped without leaving zombies.
+    duration). It then checks feasibility against known capacity (total minus
+    headroom) and raises InfeasibleTaskError synchronously if the estimate can
+    never fit, so an impossible task fails at the call site instead of silently
+    queuing forever. A background dispatch thread first re-checks feasibility
+    across the pending queue (an estimate can become infeasible after
+    crash-retry penalization doubles it) and sets InfeasibleTaskError on any
+    such task's future without killing the thread. It then gathers live state
+    each cycle (monitor snapshot, committed in-flight estimates, per-GPU VRAM,
+    running tasks' elapsed-vs-expected times) into the scheduling subsystem's
+    input dataclasses and calls plan_dispatch(). The scheduler returns an
+    ordered set of dispatch decisions (which pending tasks to start now and on
+    which GPU): front tasks are admitted in strict FIFO order while they fit,
+    and when the head is blocked, later tasks may backfill only if they cannot
+    delay the head's reservation. For each decision the executor obtains an idle
+    worker pinned to the required GPU (spawning or evicting+replacing as
+    necessary) and sends the WorkItem over that worker's queue. The worker
+    executes, measures usage, and returns a WorkResult on the shared result
+    queue. A result thread resolves the future and records the
+    ResourceObservation (including duration_seconds) into the ProfileStore,
+    which persists to disk in a debounced fashion. Workers are recycled after a
+    configurable number of tasks and reaped without leaving zombies.
 
 Features Index:
   executor:
@@ -81,6 +103,7 @@ Features Index:
       - profiles
       - resolve
       - backfill_scheduling
+      - errors
     doc: docs/features/executor.md
   backfill_scheduling:
     description: >
@@ -97,3 +120,26 @@ Features Index:
       - executor
       - profiles
     doc: docs/features/backfill-scheduling.md
+  scheduler_sim:
+    description: >
+      Deterministic discrete-event simulation of the scheduler for
+      property-style tests (admission/headroom, committed accounting,
+      head-not-delayed-vs-FIFO, head-of-line, OOM-retry storms, no-lost-tasks).
+      Policy under test is a parameter.
+    entry_points:
+      - tests/sim/harness.py::SchedulerSim.run
+      - tests/sim/harness.py::run_to_quiescence
+    depends_on:
+      - executor
+    doc: docs/features/scheduler-sim.md
+
+Testing:
+  note: >
+    Beyond the wall-clock concurrency tests, tests/sim/ hosts a virtual-clock
+    discrete-event harness that drives the real scheduling logic deterministically.
+    To make fakes substitutable without changing production behavior, the
+    executor exposes three dependency-injection seams (all defaulting to today's
+    behavior): a ``clock`` time source (defaults to time.time), an injectable
+    ``monitor`` (defaults to ResourceMonitor()), and worker spawning via the
+    overridable ``_spawn_worker``. The per-result handling was extracted into
+    ``_process_result`` so a single result can be driven through the real path.

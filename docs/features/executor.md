@@ -25,15 +25,31 @@
    - Builds a `WorkItem(module, qualname, args, kwargs)`.
    - `ProfileStore.get` returns a snapshot `LearnedProfile`; `estimate()` yields a
      `ResourceEstimate` (p90 + confidence-scaled safety margin, or hints).
+   - `_infeasible_estimate(estimate, snapshot, retry_count=0)` against a snapshot
+     (`monitor.current` or a direct `monitor.snapshot()` if not yet populated):
+     if the estimate exceeds total capacity minus headroom (`memory_gb >
+     memory_total_gb - memory_headroom_gb`, or `vram_gb > largest GPU
+     vram_total_gb - vram_headroom_gb`), raise `InfeasibleTaskError` synchronously.
+     Only declared when capacity is known (snapshot present with positive memory
+     total; for VRAM, snapshot GPUs present). Unknown capacity -> not declared.
    - Appends `PendingWork` to `self.pending`.
 2. **_dispatch_loop** (thread): `_check_workers()` then `_maybe_dispatch()`.
-   - `_maybe_dispatch()` gathers live state via `_build_dispatch_plan()` and
-     calls the pure `scheduling.plan_dispatch()` (reservation-based backfill).
-     `_build_dispatch_plan()` computes admittable memory (snapshot memory minus
-     used, headroom, and committed in-flight estimates), per-GPU admittable VRAM
-     (via `_committed_vram_per_gpu`), and each running task's remaining time
-     (via `_running_remaining_seconds`, from `duration_p90_seconds` vs elapsed).
-     When no monitor snapshot exists yet, memory/VRAM are treated as infinite
+   - `_maybe_dispatch()` first sweeps the pending queue with
+     `_infeasible_estimate(estimate, monitor.current, retry_count)`: any task
+     whose estimate can never fit (e.g. crash-retry penalization doubled it
+     past capacity) has `InfeasibleTaskError` set on its future (with
+     `retry_count` context) and is recorded abandoned; the dispatch thread
+     never raises/dies from this. Backfill would route around an infeasible
+     task rather than stall on it, but it would then sit queued forever — so
+     it must fail instead.
+   - `_maybe_dispatch()` then gathers live state via `_build_dispatch_plan()`
+     and calls the pure `scheduling.plan_dispatch()` (reservation-based
+     backfill). `_build_dispatch_plan()` computes admittable memory (snapshot
+     memory minus used, headroom, and committed in-flight estimates), per-GPU
+     admittable VRAM (via `_committed_vram_per_gpu`), and each running task's
+     remaining time (via `_running_remaining_seconds`, from
+     `duration_p90_seconds` vs elapsed, using the injected clock). When no
+     monitor snapshot exists yet, memory/VRAM are treated as infinite
      (non-gating). The scheduler returns an ordered list of `DispatchDecision`
      (pending id + GPU); the executor executes them, updating `_next_gpu_index`.
      Full semantics are in `docs/features/backfill-scheduling.md`. Admission
@@ -65,10 +81,12 @@
   (adds `tasks_completed`), `PendingWork`. Key methods:
   `_get_or_spawn_idle_worker`, `_find_idle_evictable_worker`, `_retire_worker`,
   `_should_recycle`, `_check_workers` (reaps `_retiring`), `_maybe_dispatch`,
-  `_build_dispatch_plan`, `_running_remaining_seconds`, `_committed_resources`,
-  `_committed_vram_per_gpu`, `_collect_results`.
+  `_infeasible_estimate`, `_build_dispatch_plan`, `_running_remaining_seconds`,
+  `_committed_resources`, `_committed_vram_per_gpu`, `_collect_results`.
 - `adaptive_executor/scheduling.py` — pure reservation-based backfill scheduler
   (`plan_dispatch`); see `docs/features/backfill-scheduling.md`.
+- `adaptive_executor/errors.py` — `InfeasibleTaskError` (structured fields:
+  `kind` in {"memory","vram"}, `estimate_gb`, `capacity_gb`, `retry_count`).
 - `adaptive_executor/worker.py` — `Worker`, `worker_process_entry`. Key:
   `_gpu_vram_gb` (pinned-only, per-process preferred), `_process_tree_pids`,
   `_execute_with_observation`.
@@ -83,6 +101,12 @@
 - `adaptive_executor/dtypes.py` — dataclasses.
 
 ## Invariants and constraints
+- Infeasibility is a permanent condition (estimate > total capacity minus
+  headroom), distinct from "doesn't fit right now" (normal queuing/backpressure).
+  It is only ever declared when capacity is known; unknown capacity leaves
+  admission behavior unchanged. It is raised synchronously from `submit()` and
+  attached to the future (never raised) in the dispatch thread, which keeps
+  running and moves on to the next pending task.
 - A `WorkerSlot` in `self.workers` is alive or about to be reaped by
   `_check_workers`; retired workers live only in `self._retiring` until joined.
 - Workers are pinned to one GPU (NVML index) for their lifetime; a pin change

@@ -12,7 +12,8 @@ from dataclasses import dataclass, replace
 from queue import Empty
 from typing import Callable, Literal
 
-from .dtypes import ResourceEstimate, WorkItem, WorkResult
+from .dtypes import ResourceEstimate, ResourceSnapshot, WorkItem, WorkResult
+from .errors import InfeasibleTaskError
 from .monitor import ResourceMonitor
 from .profiles import ProfileStore
 from .resolve import validate_submittable
@@ -71,6 +72,8 @@ class AdaptiveExecutor:
         on_timeout: Literal["fail_future", "kill_worker"] = "fail_future",
         max_resource_crash_retries: int = 1,
         worker_recycle_after_tasks: int | None = 50,
+        monitor: "ResourceMonitor | None" = None,
+        clock: Callable[[], float] = time.time,
     ):
         self.max_workers = max_workers or os.cpu_count() or 4
         self.gpu_ids = gpu_ids
@@ -83,7 +86,11 @@ class AdaptiveExecutor:
         self._next_gpu_index = 0
         self._next_worker_id = 0
 
-        self.monitor = ResourceMonitor()
+        # Time source and monitor are injectable seams so a deterministic
+        # simulation can substitute a virtual clock and a synthetic monitor.
+        # Defaults preserve exactly the production wall-clock/NVML behavior.
+        self._clock = clock
+        self.monitor = monitor if monitor is not None else ResourceMonitor()
         self.profiles = ProfileStore(persist_path=profile_path)
 
         self.result_queue: mp.Queue = mp.Queue()
@@ -189,12 +196,21 @@ class AdaptiveExecutor:
         profile = self.profiles.get(item.fn_module, item.fn_name)
         estimate = profile.estimate(memory_hint=memory_gb, vram_hint=vram_gb)
 
+        # Reject a task that can never fit on this machine before it ever enters
+        # the queue, so it fails at the call site instead of silently blocking
+        # the FIFO head forever. The polled snapshot may not be populated yet
+        # right after auto-start, so take a direct reading in that case.
+        snapshot = self.monitor.current or self.monitor.snapshot()
+        infeasible = self._infeasible_estimate(estimate, snapshot, retry_count=0)
+        if infeasible is not None:
+            raise infeasible
+
         future = Future()
         pending = PendingWork(
             item=item,
             future=future,
             estimate=estimate,
-            submitted_at=time.time(),
+            submitted_at=self._clock(),
         )
 
         with self.lock:
@@ -210,6 +226,26 @@ class AdaptiveExecutor:
 
     def _maybe_dispatch(self):
         with self.lock:
+            if not self.pending:
+                return
+
+            # Fail any queued task whose estimate can never fit (e.g. crash-
+            # retry penalization doubled it past capacity). Backfill would
+            # route around an infeasible task rather than stall on it, but it
+            # would then sit queued forever; fail its future so callers see
+            # the error. The dispatch thread itself must keep running.
+            snapshot = self.monitor.current
+            feasible: deque[PendingWork] = deque()
+            for pending in self.pending:
+                infeasible = self._infeasible_estimate(
+                    pending.estimate, snapshot, retry_count=pending.retry_count
+                )
+                if infeasible is None:
+                    feasible.append(pending)
+                    continue
+                pending.future.set_exception(infeasible)
+                self.completed_or_abandoned.add(pending.item.id)
+            self.pending = feasible
             if not self.pending:
                 return
 
@@ -233,7 +269,7 @@ class AdaptiveExecutor:
 
                 pending.assigned_gpu_id = decision.gpu_id
                 pending.worker_id = worker.worker_id
-                pending.started_at = time.time()
+                pending.started_at = self._clock()
                 self.in_flight[pending.item.id] = pending
                 worker.current_work_id = pending.item.id
                 worker.work_queue.put(replace(pending.item, gpu_id=decision.gpu_id))
@@ -244,12 +280,52 @@ class AdaptiveExecutor:
                     p for p in self.pending if p.item.id not in dispatched
                 )
 
+    def _infeasible_estimate(
+        self,
+        estimate: ResourceEstimate,
+        snapshot: ResourceSnapshot | None,
+        retry_count: int,
+    ) -> InfeasibleTaskError | None:
+        """Return an error if ``estimate`` can never fit, else ``None``.
+
+        Infeasibility means the estimate exceeds *total* capacity minus headroom
+        — a permanent condition, distinct from "doesn't fit right now" (normal
+        queuing). It is only declared when capacity is actually known: memory
+        needs a snapshot with a positive total; VRAM additionally needs GPU info.
+        When capacity is unknown, returns ``None`` so admission behaves as before.
+        """
+        if snapshot is None:
+            return None
+
+        if snapshot.memory_total_gb > 0:
+            memory_capacity = snapshot.memory_total_gb - self.memory_headroom_gb
+            if estimate.memory_gb > memory_capacity:
+                return InfeasibleTaskError(
+                    kind="memory",
+                    estimate_gb=estimate.memory_gb,
+                    capacity_gb=memory_capacity,
+                    retry_count=retry_count,
+                )
+
+        if estimate.vram_gb > 0 and snapshot.gpus:
+            largest_vram_total = max(g.vram_total_gb for g in snapshot.gpus.values())
+            vram_capacity = largest_vram_total - self.vram_headroom_gb
+            if estimate.vram_gb > vram_capacity:
+                return InfeasibleTaskError(
+                    kind="vram",
+                    estimate_gb=estimate.vram_gb,
+                    capacity_gb=vram_capacity,
+                    retry_count=retry_count,
+                )
+
+        return None
+
     def _build_dispatch_plan(self):
         """Gather live state and delegate the scheduling decision to the pure
         reservation-based backfill scheduler in :mod:`adaptive_executor.scheduling`.
         """
         snapshot = self.monitor.current
-        now = time.time()
+        now = self._clock()
         committed = self._committed_resources()
         committed_vram = self._committed_vram_per_gpu()
         gpu_ids = self.gpu_ids or []
@@ -440,40 +516,49 @@ class AdaptiveExecutor:
             except Empty:
                 continue
 
-            with self.lock:
-                worker = self.workers.get(result.worker_id)
-                if worker is not None and worker.current_work_id == result.id:
-                    worker.current_work_id = None
-                    worker.tasks_completed += 1
-                    # Recycle a worker that has processed enough tasks so its RSS
-                    # baseline (which CPython rarely returns to the OS) cannot
-                    # ratchet up and cause future memory observations to shrink.
-                    if self._should_recycle(worker):
-                        self._retire_worker(worker, reason="recycle")
+            self._process_result(result)
 
-                pending = self.in_flight.pop(result.id, None)
-                if pending is None:
-                    continue
+    def _process_result(self, result: WorkResult) -> None:
+        """Handle a single worker result: clear/recycle the worker, pop the
+        in-flight entry, record the observation, and resolve the future.
 
-                if pending.result_ignored:
-                    self.completed_or_abandoned.add(result.id)
-                    continue
+        Extracted from the ``_collect_results`` loop body so the same logic can
+        be driven one result at a time (e.g. by a deterministic simulation).
+        """
+        with self.lock:
+            worker = self.workers.get(result.worker_id)
+            if worker is not None and worker.current_work_id == result.id:
+                worker.current_work_id = None
+                worker.tasks_completed += 1
+                # Recycle a worker that has processed enough tasks so its RSS
+                # baseline (which CPython rarely returns to the OS) cannot
+                # ratchet up and cause future memory observations to shrink.
+                if self._should_recycle(worker):
+                    self._retire_worker(worker, reason="recycle")
 
-            self.profiles.record(
-                pending.item.fn_module,
-                pending.item.fn_name,
-                result.observation,
-            )
+            pending = self.in_flight.pop(result.id, None)
+            if pending is None:
+                return
 
-            if result.success:
-                pending.future.set_result(result.result)
-            else:
-                pending.future.set_exception(result.exception)
+            if pending.result_ignored:
+                self.completed_or_abandoned.add(result.id)
+                return
+
+        self.profiles.record(
+            pending.item.fn_module,
+            pending.item.fn_name,
+            result.observation,
+        )
+
+        if result.success:
+            pending.future.set_result(result.result)
+        else:
+            pending.future.set_exception(result.exception)
 
     def _check_timeouts(self):
         while not self._threads_should_stop:
             time.sleep(0.1)
-            now = time.time()
+            now = self._clock()
             timed_out: list[PendingWork] = []
 
             with self.lock:
