@@ -14,6 +14,9 @@
 - Correct interaction with exclusive tasks (`PendingWork.exclusive`): an
   exclusive task runs alone for its entire run — as a blocked head it admits no
   backfill, and once in flight it blocks all dispatch until it finishes.
+- Cold-start canary clamp: while a profile identity is *cold* (zero
+  observations), at most one task of that identity may run at a time. The clamp
+  lives in the pure scheduler and applies to both front admission and backfill.
 
 ## Non-scope
 - Worker-pool lifecycle, GPU pinning, timeouts, crash retry, persistence — all
@@ -36,6 +39,15 @@
   - **(b) short-enough**: it fits now *and* its expected duration means it
     finishes before the reservation time, releasing its resources before the
     head needs them.
+- **Cold-start canary**: a `PendingEntry` carries an optional `profile_identity`
+  (the store key estimation drew from) and a `cold` flag (its profile has zero
+  observations and no user hint). `RunningEntry` carries the same
+  `profile_identity`. A cold task may not be admitted while any running or
+  already-planned task shares its identity — so a burst of identical first-
+  contact submits cannot all start together under one default estimate into a
+  simultaneous OOM. The first task warms the profile; combined with dispatch-
+  time re-estimation (see `docs/features/executor.md`), the queued siblings
+  automatically stop being cold and unclamp with a learned estimate.
 
 ## Data / control flow
 1. **submit()** → `LearnedProfile.estimate()` now also computes
@@ -66,15 +78,25 @@
       running set, so nothing else may be dispatched this cycle.
    1. Greedily admit front tasks that fit now, in FIFO order (identical to strict
       FIFO). Each front admit consumes the live pools and becomes an occupant
-      that starts now (remaining = its own p90 duration).
-   2. The first task that does not fit now is the **head**.
+      that starts now (remaining = its own p90 duration). A cold task whose
+      identity is already held (by a running task or one admitted earlier this
+      cycle) is `_canary_blocked` and stops front admission exactly like a
+      resource-blocked head. Each admit adds its `profile_identity` to the
+      planner's `held_identities` set, so a second cold sibling is refused.
+   2. The first task that does not fit now (or is canary-blocked) is the **head**.
       - If the head is **exclusive**, stop — no backfill.
       - Otherwise compute the head's reservation (`_compute_reservation`): the
         earliest release time at which the head fits, projecting occupants that
         free by that time (`_state_at`). Infinite if unreachable from finite
         releases.
-   3. Scan the rest of the queue in FIFO order (`_backfill`). For each candidate
-      that passes the GPU-independent gates (`_fits_nongpu`): classify as rule
+      If the head is **cold-blocked** by the canary, its reservation is forced
+      to infinite (the running canary is cold, so its release time is unknown),
+      which disables rule (b) — only disjoint rule-(a) backfill may pass it, so
+      feasible non-cold work behind it is not stalled.
+   3. Scan the rest of the queue in FIFO order (`_backfill`). Cold candidates
+      whose identity is already held are skipped (`_canary_blocked`). For each
+      remaining candidate that passes the GPU-independent gates (`_fits_nongpu`):
+      classify as rule
       (b) if the reservation is finite and its duration ≤ reservation; else check
       rule (a) via `_head_still_fits_with_hold` (does the head still fit at its
       reservation while this candidate holds its resources indefinitely?). GPU
@@ -104,13 +126,21 @@
   marked exclusive, and must keep the machine to itself for its whole retry.
 - **No snapshot ⇒ memory/VRAM non-gating.** Before the first monitor snapshot,
   memory and VRAM are treated as infinite, matching prior startup admission.
+- **Cold identity ⇒ one canary at a time.** A cold task (`cold=True`) whose
+  `profile_identity` is already held by a running or planned task is not
+  admitted (front or backfill); a cold-blocked head reserves at infinity (rule
+  (a) only). A cold task with a free identity is admitted as its own canary.
+  Tasks with an explicit user hint are never cold (the executor sets `cold`),
+  so hints bypass the canary — the caller asserted resource knowledge.
 
 ## Files and roles
 - `adaptive_executor/scheduling.py` — pure scheduler. Inputs: `PendingEntry`,
   `RunningEntry`, `Capacity`. Output: `DispatchPlan(decisions, next_gpu_index)`.
   Entry point `plan_dispatch`; internal `_Planner` implements front admission,
   `_compute_reservation`, `_state_at`, `_backfill`, `_place_backfill`,
-  `_head_still_fits_with_hold`, `_fits`/`_fits_nongpu`, `_gpu_options`.
+  `_head_still_fits_with_hold`, `_fits`/`_fits_nongpu`, `_gpu_options`,
+  `_canary_blocked` and the `held_identities` set. `PendingEntry` gains
+  `profile_identity`/`cold`; `RunningEntry` gains `profile_identity`.
 - `adaptive_executor/adaptive_executor.py` — `_maybe_dispatch` (executes the
   plan), `_build_dispatch_plan` (gathers state), `_running_remaining_seconds`,
   reused `_committed_resources` / `_committed_vram_per_gpu`.
@@ -118,6 +148,9 @@
 - `adaptive_executor/profiles.py` — `LearnedProfile.estimate()` computes the p90
   duration.
 - `tests/test_scheduling.py` — pure unit tests (all scenarios).
+- `tests/test_canary.py` — pure unit tests for the cold-start canary (one cold
+  task per identity, different identities unaffected, warm/hint bypass,
+  cold-blocked head + disjoint backfill).
 - `tests/test_scheduling_exclusive.py` — pure unit tests for exclusive *run*
   isolation (a running exclusive task blocks all dispatch; exclusivity lifts
   when it leaves the running set).
@@ -146,3 +179,7 @@
   always resolved in the conservative (FIFO-ward) direction.
 - **Reservation recomputed every cycle** from current running state, so overruns
   naturally slip the reservation.
+- **One cold canary per identity.** While a profile identity is cold, at most
+  one task of that identity is ever in flight. The clamp is enforced in the pure
+  scheduler for both front admission and backfill, and never stalls feasible
+  non-cold work (a cold-blocked head admits disjoint rule-(a) backfill).

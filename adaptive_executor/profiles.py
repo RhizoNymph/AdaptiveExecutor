@@ -21,6 +21,12 @@ logger = logging.getLogger("adaptive_executor.profiles")
 # themselves (two keys that differ only around a ``#`` are their responsibility).
 STORE_KEY_SEPARATOR = "#"
 
+# Crash-floor recovery: a persistent memory floor is cleared once this many
+# consecutive successful observations all peak below ``FLOOR_RECOVERY_FRACTION``
+# of the floor, so a workload that has genuinely shrunk is not penalized forever.
+FLOOR_RECOVERY_OBSERVATIONS = 5
+FLOOR_RECOVERY_FRACTION = 0.5
+
 
 def derive_store_key(
     fn_module: str, fn_name: str, profile_key: str | None = None
@@ -42,11 +48,51 @@ def derive_store_key(
 class LearnedProfile:
     observations: list[ResourceObservation] = field(default_factory=list)
     max_observations: int = 100
+    # Persistent memory lower bound (GB) learned from an OOM/SIGKILL crash: the
+    # estimate the task was admitted under was proven too small, so future
+    # estimates for this profile are floored at this value even though the
+    # crashing run reported no observation. ``None`` means no active floor.
+    memory_floor_gb: float | None = None
 
     def add(self, obs: ResourceObservation):
         self.observations.append(obs)
         if len(self.observations) > self.max_observations:
             self.observations = self.observations[-self.max_observations:]
+        self._maybe_recover_floor()
+
+    def set_memory_floor(self, floor_gb: float) -> None:
+        """Ratchet the persistent memory floor up to at least ``floor_gb``.
+
+        Floors only ever ratchet upward while active (``max(old, new)``); they
+        are lowered only by the recovery rule in :meth:`_maybe_recover_floor`.
+        """
+        previous = self.memory_floor_gb
+        self.memory_floor_gb = floor_gb if previous is None else max(previous, floor_gb)
+        logger.info(
+            "memory floor set previous=%s new=%.3f",
+            f"{previous:.3f}" if previous is not None else None,
+            self.memory_floor_gb,
+        )
+
+    def _maybe_recover_floor(self) -> None:
+        """Clear an active floor once ``FLOOR_RECOVERY_OBSERVATIONS`` consecutive
+        successful observations all peak below ``FLOOR_RECOVERY_FRACTION`` of it,
+        so a workload that has genuinely shrunk is not floored forever.
+        """
+        if self.memory_floor_gb is None:
+            return
+        recent = self.observations[-FLOOR_RECOVERY_OBSERVATIONS:]
+        if len(recent) < FLOOR_RECOVERY_OBSERVATIONS:
+            return
+        threshold = self.memory_floor_gb * FLOOR_RECOVERY_FRACTION
+        if all(o.memory_delta_gb < threshold for o in recent):
+            logger.info(
+                "memory floor cleared floor=%.3f after %d observations below %.3f",
+                self.memory_floor_gb,
+                FLOOR_RECOVERY_OBSERVATIONS,
+                threshold,
+            )
+            self.memory_floor_gb = None
 
     @property
     def sample_count(self) -> int:
@@ -93,8 +139,15 @@ class LearnedProfile:
         # At confidence=0, add 50% margin; at confidence=1, no margin.
         safety_multiplier = 1.0 + 0.5 * (1.0 - confidence)
 
+        # Persistent crash floor lower-bounds memory AFTER the safety margin (and
+        # after any hint): OOM knowledge is empirical fact that a smaller estimate
+        # was proven insufficient, so it wins over an optimistic hint/percentile.
+        memory_out = max(0.1, memory * safety_multiplier)
+        if self.memory_floor_gb is not None:
+            memory_out = max(memory_out, self.memory_floor_gb)
+
         return ResourceEstimate(
-            memory_gb=max(0.1, memory * safety_multiplier),
+            memory_gb=memory_out,
             vram_gb=max(0.0, vram * safety_multiplier),
             cpu_cores=max(0.1, cpu_cores),  # CPU doesn't need safety margin
             confidence=confidence,
@@ -169,7 +222,31 @@ class ProfileStore:
             profile = self._select_profile_locked(fn_module, fn_name, profile_key)
             copy = LearnedProfile(max_observations=profile.max_observations)
             copy.observations = list(profile.observations)  # shallow copy of list
+            copy.memory_floor_gb = profile.memory_floor_gb
             return copy
+
+    def estimation_identity(
+        self, fn_module: str, fn_name: str, profile_key: str | None = None
+    ) -> tuple[str, int]:
+        """Return ``(store_key, sample_count)`` for the profile that estimation
+        would actually draw from — the keyed bucket when it has observations,
+        else the base aggregate.
+
+        This is the profile *identity* used by the cold-start canary: a task is
+        "cold" when the identity it estimates from has zero observations. A keyed
+        submit that falls back to a base profile with observations therefore
+        reports the base identity with a positive count (i.e. not cold). Reads
+        via ``dict.get`` so no empty entry is materialized.
+        """
+        with self.lock:
+            if profile_key is not None:
+                keyed_key = derive_store_key(fn_module, fn_name, profile_key)
+                keyed = self.profiles.get(keyed_key)
+                if keyed is not None and keyed.observations:
+                    return keyed_key, keyed.sample_count
+            base_key = derive_store_key(fn_module, fn_name)
+            base = self.profiles.get(base_key)
+            return base_key, (base.sample_count if base is not None else 0)
 
     def record(
         self,
@@ -183,7 +260,7 @@ class ProfileStore:
         profile. The base profile always accumulates every observation so it
         remains the aggregate fallback.
         """
-        snapshot: dict[str, list[dict]] | None = None
+        snapshot: dict[str, object] | None = None
         with self.lock:
             self.profiles[derive_store_key(fn_module, fn_name)].add(observation)
             if profile_key is not None:
@@ -199,9 +276,39 @@ class ProfileStore:
         if snapshot is not None:
             self._persist_snapshot(snapshot)
 
+    def record_memory_floor(
+        self,
+        fn_module: str,
+        fn_name: str,
+        floor_gb: float,
+        profile_key: str | None = None,
+    ):
+        """Persist a memory floor into the base profile and, when a
+        ``profile_key`` is supplied, additionally into the keyed profile.
+
+        Mirrors :meth:`record`'s dual-write so OOM knowledge survives even when a
+        crash happened under an input-bucketed submit. Floors ratchet upward
+        (never weakened here) and participate in the same debounced persistence.
+        """
+        snapshot: dict | None = None
+        with self.lock:
+            self.profiles[derive_store_key(fn_module, fn_name)].set_memory_floor(floor_gb)
+            if profile_key is not None:
+                self.profiles[
+                    derive_store_key(fn_module, fn_name, profile_key)
+                ].set_memory_floor(floor_gb)
+            self._pending_since_save += 1
+            if self._should_save_locked():
+                snapshot = self._snapshot_locked()
+                self._pending_since_save = 0
+                self._last_save_time = self._clock()
+
+        if snapshot is not None:
+            self._persist_snapshot(snapshot)
+
     def flush(self):
         """Force an immediate persist of the current profiles (if configured)."""
-        snapshot: dict[str, list[dict]] | None = None
+        snapshot: dict[str, object] | None = None
         with self.lock:
             if self.persist_path is None:
                 return
@@ -219,13 +326,28 @@ class ProfileStore:
             return True
         return (self._clock() - self._last_save_time) >= self.save_interval_seconds
 
-    def _snapshot_locked(self) -> dict[str, list[dict]]:
-        return {
-            key: [asdict(o) for o in profile.observations]
-            for key, profile in self.profiles.items()
-        }
+    def _snapshot_locked(self) -> dict[str, object]:
+        """Serialize profiles for persistence.
 
-    def _persist_snapshot(self, data: dict[str, list[dict]]):
+        A profile with no active floor is stored as a plain observation list
+        (the original, forward/backward-compatible format). A profile carrying a
+        memory floor is stored as ``{"observations": [...], "memory_floor_gb":
+        X}`` so the floor round-trips. :meth:`_load` accepts both shapes, and
+        older files (all plain lists) load unchanged.
+        """
+        result: dict[str, object] = {}
+        for key, profile in self.profiles.items():
+            obs = [asdict(o) for o in profile.observations]
+            if profile.memory_floor_gb is None:
+                result[key] = obs
+            else:
+                result[key] = {
+                    "observations": obs,
+                    "memory_floor_gb": profile.memory_floor_gb,
+                }
+        return result
+
+    def _persist_snapshot(self, data: dict[str, object]):
         """Write ``data`` to disk atomically, logging (not raising) on failure."""
         if self.persist_path is None:
             return
@@ -237,7 +359,7 @@ class ProfileStore:
                     "profile save failed path=%s error=%r", self.persist_path, exc
                 )
 
-    def _write_atomic(self, data: dict[str, list[dict]]):
+    def _write_atomic(self, data: dict[str, object]):
         """Atomically persist ``data`` using write-to-temp-then-rename."""
         assert self.persist_path is not None
         self.persist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -261,10 +383,22 @@ class ProfileStore:
         assert self.persist_path is not None
         try:
             data = json.loads(self.persist_path.read_text())
-            for key, obs_list in data.items():
+            for key, value in data.items():
+                # Backward compatible: a plain list is the original
+                # observations-only format; a dict additionally carries the
+                # persisted memory floor. Files predating floors have no dicts.
+                if isinstance(value, dict):
+                    obs_list = value.get("observations", [])
+                    floor = value.get("memory_floor_gb")
+                else:
+                    obs_list = value
+                    floor = None
                 profile = LearnedProfile()
                 for o in obs_list:
                     profile.add(ResourceObservation(**o))
+                # Set the floor AFTER loading observations so recovery is not
+                # spuriously triggered against the just-restored history.
+                profile.memory_floor_gb = floor
                 self.profiles[key] = profile
         except (OSError, json.JSONDecodeError, TypeError, KeyError) as exc:
             logger.warning(

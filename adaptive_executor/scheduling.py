@@ -38,6 +38,22 @@ ends of the task's life:
 * While an exclusive task is the blocked *head*, it admits no backfill (it needs
   the in-flight set to drain to empty, and admitting anything would delay that).
 
+Cold-start canary
+-----------------
+A task is *cold* when its estimation profile has zero observations (first
+contact), and no user hint bypasses it. While cold, at most ONE task per profile
+identity may run at a time: :func:`plan_dispatch` refuses to admit a cold task
+whose identity is already held by a running or already-planned task, in both
+front admission and backfill. This prevents N identical first-contact submits
+from all being admitted under the same default estimate into a simultaneous
+mass OOM — the whole point of the library. The first task warms the profile;
+once it reports an observation the siblings are no longer cold and unclamp with
+a learned estimate. A cold-blocked head is treated like any blocked head, but
+its reservation is infinite (the running canary is cold, so its release time is
+unknown), so only disjoint rule-(a) backfill may pass it — feasible non-cold
+work is never stalled behind it. Tasks carrying an explicit ``memory_gb`` /
+``vram_gb`` hint are never cold (the caller asserted resource knowledge).
+
 Conservative fallbacks
 ----------------------
 * Unknown duration (``duration_p90_seconds is None``) is treated as INFINITE. A
@@ -82,6 +98,12 @@ class PendingEntry:
     # None => unknown duration => treated as infinite for backfill.
     duration_p90_seconds: float | None
     exclusive: bool = False
+    # Cold-start canary. ``profile_identity`` is the estimation profile's store
+    # key; ``cold`` is True when that profile has zero observations (first
+    # contact). While cold, at most one task per identity may run at a time, so a
+    # first-contact batch cannot all be admitted together into a mass OOM.
+    profile_identity: str | None = None
+    cold: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +120,9 @@ class RunningEntry:
     # An exclusive in-flight task must run alone: while it is running, no other
     # task may be dispatched this cycle (see :meth:`_Planner.run`).
     exclusive: bool = False
+    # Estimation profile identity of this running task. A running task holds its
+    # identity so a cold pending task sharing it must wait (the canary rule).
+    profile_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,6 +195,12 @@ class _Planner:
             rr=capacity.next_gpu_index,
         )
         self.decisions: list[DispatchDecision] = []
+        # Cold-start canary: identities currently held by a running or
+        # already-admitted-this-cycle task. A cold pending task whose identity is
+        # already held must wait, so only one cold task per identity runs at once.
+        self.held_identities: set[str] = {
+            r.profile_identity for r in running if r.profile_identity is not None
+        }
 
     def run(self) -> DispatchPlan:
         # 0. An exclusive task already in flight owns the whole machine for its
@@ -183,6 +214,11 @@ class _Planner:
         # 1. Greedily admit front tasks that fit now (strict FIFO behavior).
         while self.queue:
             head = self.queue[0]
+            if self._canary_blocked(head):
+                # A cold task whose identity is already running/planned: it is
+                # blocked exactly like a resource-blocked head. Stop front
+                # admission here and let backfill route feasible work around it.
+                break
             fits, gpu_id, new_rr = self._fits(
                 head, self.pools.memory_free, self.pools.gpu_free, self.pools.slots, self.pools.rr
             )
@@ -206,13 +242,30 @@ class _Planner:
             # admitting anything delays that drain. No backfill.
             return self._plan()
 
-        reservation = self._compute_reservation(head)
+        if self._canary_blocked(head):
+            # A cold-blocked head has no known release time (the running canary
+            # is cold, so its duration is unknown). Treat the reservation as
+            # infinite: rule (b) is disabled and only disjoint rule-(a) backfill
+            # may pass it, so feasible non-cold work is not stalled behind it.
+            reservation = math.inf
+        else:
+            reservation = self._compute_reservation(head)
         self._backfill(head, reservation)
         return self._plan()
 
     def _plan(self) -> DispatchPlan:
         return DispatchPlan(
             decisions=tuple(self.decisions), next_gpu_index=self.pools.rr
+        )
+
+    def _canary_blocked(self, task: PendingEntry) -> bool:
+        """A cold task may not start while another task of the same estimation
+        identity is already running or planned this cycle (the cold-start canary).
+        """
+        return (
+            task.cold
+            and task.profile_identity is not None
+            and task.profile_identity in self.held_identities
         )
 
     # -- admission primitives ------------------------------------------------
@@ -293,6 +346,10 @@ class _Planner:
         if gpu_id is not None and gpu_id in self.pools.gpu_free:
             self.pools.gpu_free[gpu_id] -= task.vram_gb
         self.pools.slots += 1
+        # Register the identity as held so a second cold task of the same
+        # identity admitted later this cycle is refused by the canary.
+        if task.profile_identity is not None:
+            self.held_identities.add(task.profile_identity)
         if releases_before_reservation is None:
             # Front admit: becomes an occupant that starts now.
             self.occupants.append(
@@ -366,6 +423,10 @@ class _Planner:
 
     def _backfill(self, head: PendingEntry, reservation: float) -> None:
         for candidate in self.queue[1:]:
+            if self._canary_blocked(candidate):
+                # A cold candidate sharing an already-held identity may not
+                # backfill either; its canary sibling must warm the profile first.
+                continue
             if not self._fits_nongpu(candidate):
                 continue
 
