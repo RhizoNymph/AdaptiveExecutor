@@ -129,6 +129,32 @@ with AdaptiveExecutor() as executor:
         print(err.retry_count)  # >0 if a crash-retry penalty caused it
 ```
 
+## Cancellation
+
+`submit()` returns a standard `concurrent.futures.Future`, and `cancel()`
+follows the standard semantics:
+
+- **Queued tasks are cancellable.** While a task is still waiting in the queue,
+  `future.cancel()` returns `True`, frees its queue slot immediately, and the
+  task is never dispatched or executed.
+- **Running tasks are not.** Once the executor ships a task to a worker its
+  future transitions to `RUNNING` and `cancel()` returns `False` — you cannot
+  cancel work that has already started (including a crash-retry of a task that
+  already ran once).
+- **The transition is atomic.** The queued/running boundary is decided by
+  `set_running_or_notify_cancel()` at dispatch time, so a `cancel()` that races
+  the dispatch has exactly one winner: either the task is cancelled and never
+  runs, or it is dispatched and `cancel()` returns `False`. A cancelled task is
+  never handed a result or an exception.
+
+```python
+future = executor.submit(train, dataset)
+if future.cancel():
+    ...  # was still queued; it will never run
+else:
+    ...  # already running; let it finish or wait on future.result()
+```
+
 ## Resource Hints
 
 You can provide hints if you know the resource requirements upfront:

@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from concurrent.futures import Future
+from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass, replace
 from queue import Empty
 from typing import Callable, Literal
@@ -48,6 +48,11 @@ class PendingWork:
     retry_count: int = 0
     exclusive: bool = False
     result_ignored: bool = False
+    # True once the running handshake (``set_running_or_notify_cancel``) has put
+    # this future into the RUNNING state. The handshake must run exactly once per
+    # future; a crash-retry re-queues an already-RUNNING future, so re-dispatch
+    # must skip it (and ``cancel()`` already returns False on a running task).
+    running_notified: bool = False
     # Observed-usage accounting (parent-side polling). Baselines are captured at
     # dispatch; ``observed_*`` are the current attributable usage above baseline,
     # refreshed at most once per ``_observation_refresh_seconds``. The full
@@ -220,7 +225,16 @@ class AdaptiveExecutor:
             **kwargs: Keyword arguments
 
         Returns:
-            Future that will contain the result
+            Future that will contain the result.
+
+            Cancellation follows standard ``concurrent.futures`` semantics: while
+            the task is still queued, ``future.cancel()`` succeeds, frees its
+            queue slot, and the task is never executed. Once the executor
+            dispatches it to a worker the future transitions to RUNNING and
+            ``cancel()`` returns ``False`` — a running task cannot be cancelled.
+            The dispatch/running transition is decided atomically by
+            ``set_running_or_notify_cancel()`` at ship time, so exactly one of
+            "cancelled" or "dispatched" wins a race between the two.
         """
         if self._shutdown or not self._accepting:
             raise RuntimeError("Cannot submit to a shutdown AdaptiveExecutor")
@@ -292,7 +306,10 @@ class AdaptiveExecutor:
                 if infeasible is None:
                     feasible.append(pending)
                     continue
-                pending.future.set_exception(infeasible)
+                # A queued task the caller already cancelled is done: drop it as
+                # abandoned rather than stuffing an exception into a cancelled
+                # future (which would raise InvalidStateError).
+                self._settle_future_exception(pending, infeasible)
                 self.completed_or_abandoned.add(pending.item.id)
             self.pending = feasible
             if not self.pending:
@@ -305,6 +322,7 @@ class AdaptiveExecutor:
 
             by_id = {p.item.id: p for p in self.pending}
             dispatched: set[str] = set()
+            cancelled: set[str] = set()
             for decision in plan.decisions:
                 pending = by_id.get(decision.pending_id)
                 if pending is None:
@@ -316,6 +334,28 @@ class AdaptiveExecutor:
                     # stall FIFO identically.
                     continue
 
+                # Running handshake, immediately before shipping and only once a
+                # worker is secured so the future is still PENDING here. Run it
+                # exactly once per future: a crash-retry re-queues an already-
+                # RUNNING future, and calling the handshake twice raises. If the
+                # caller already cancelled this queued task,
+                # set_running_or_notify_cancel() returns False: drop it as
+                # abandoned, never dispatch, and leave worker state untouched
+                # (current_work_id stays None, so the worker is reused next
+                # decision). After it returns True the future is RUNNING and
+                # cancel() can no longer succeed, so the in-flight accounting can
+                # never be cancelled out from under us.
+                if not pending.running_notified:
+                    if not pending.future.set_running_or_notify_cancel():
+                        logger.debug(
+                            "dropping cancelled queued task work_id=%s",
+                            pending.item.id,
+                        )
+                        self.completed_or_abandoned.add(pending.item.id)
+                        cancelled.add(pending.item.id)
+                        continue
+                    pending.running_notified = True
+
                 pending.assigned_gpu_id = decision.gpu_id
                 pending.worker_id = worker.worker_id
                 pending.started_at = self._clock()
@@ -325,9 +365,10 @@ class AdaptiveExecutor:
                 worker.work_queue.put(replace(pending.item, gpu_id=decision.gpu_id))
                 dispatched.add(pending.item.id)
 
-            if dispatched:
+            removed = dispatched | cancelled
+            if removed:
                 self.pending = deque(
-                    p for p in self.pending if p.item.id not in dispatched
+                    p for p in self.pending if p.item.id not in removed
                 )
 
     def _infeasible_estimate(
@@ -831,10 +872,13 @@ class AdaptiveExecutor:
             profile_key=pending.profile_key,
         )
 
+        # Guard both settle paths: a late result for a future already resolved
+        # by timeout/crash handling (or cancelled) must never raise
+        # InvalidStateError and kill this collector thread.
         if result.success:
-            pending.future.set_result(result.result)
+            self._settle_future_result(pending, result.result)
         else:
-            pending.future.set_exception(result.exception)
+            self._settle_future_exception(pending, result.exception)
 
     def _check_timeouts(self):
         while not self._threads_should_stop:
@@ -887,8 +931,9 @@ class AdaptiveExecutor:
         if worker_to_kill is not None:
             self._escalate_kill(worker_to_kill)
 
-        active.future.set_exception(
-            TimeoutError(f"Task {active.item.id} timed out after {self.task_timeout_seconds}s")
+        self._settle_future_exception(
+            active,
+            TimeoutError(f"Task {active.item.id} timed out after {self.task_timeout_seconds}s"),
         )
         self.completed_or_abandoned.add(active.item.id)
 
@@ -1006,8 +1051,9 @@ class AdaptiveExecutor:
                 self.pending.appendleft(lost_pending)
             return
 
-        lost_pending.future.set_exception(
-            RuntimeError(f"Worker {worker.worker_id} crashed with exit code {worker.process.exitcode}")
+        self._settle_future_exception(
+            lost_pending,
+            RuntimeError(f"Worker {worker.worker_id} crashed with exit code {worker.process.exitcode}"),
         )
         self.completed_or_abandoned.add(lost_pending.item.id)
 
@@ -1031,8 +1077,61 @@ class AdaptiveExecutor:
         with self.lock:
             while self.pending:
                 pending = self.pending.popleft()
-                pending.future.set_exception(exc)
+                # A queued task the caller cancelled is already done: drop it as
+                # abandoned instead of raising InvalidStateError on shutdown.
+                self._settle_future_exception(pending, exc)
                 self.completed_or_abandoned.add(pending.item.id)
+
+    # -- future settling (cancellation-safe) ----------------------------------
+
+    def _settle_future_result(self, pending: PendingWork, value: object) -> None:
+        """Resolve ``pending.future`` with ``value`` unless it is already done.
+
+        A future can already be done because the caller cancelled it, a timeout
+        fired, or the worker was declared dead — in which case a late result must
+        be dropped rather than raise ``InvalidStateError`` into the background
+        thread. ``done()`` is the primary guard; the narrow ``InvalidStateError``
+        except closes the tiny race where a caller cancels between the check and
+        the set (``cancel()`` only wins while the future is still pending).
+        """
+        if pending.future.done():
+            logger.warning(
+                "dropping result for already-done future work_id=%s",
+                pending.item.id,
+            )
+            return
+        try:
+            pending.future.set_result(value)
+        except InvalidStateError as exc:
+            logger.warning(
+                "future resolved concurrently work_id=%s error=%r",
+                pending.item.id,
+                exc,
+            )
+
+    def _settle_future_exception(self, pending: PendingWork, exc: BaseException) -> None:
+        """Set ``exc`` on ``pending.future`` unless it is already done.
+
+        Same guard rationale as :meth:`_settle_future_result`: a cancelled or
+        already-resolved future must never take an exception (that would raise
+        ``InvalidStateError`` and kill a background thread). Callers still record
+        the task in ``completed_or_abandoned`` themselves.
+        """
+        if pending.future.done():
+            logger.debug(
+                "dropping exception for already-done future work_id=%s exc=%s",
+                pending.item.id,
+                type(exc).__name__,
+            )
+            return
+        try:
+            pending.future.set_exception(exc)
+        except InvalidStateError as err:
+            logger.warning(
+                "future resolved concurrently work_id=%s error=%r",
+                pending.item.id,
+                err,
+            )
 
     def _wait_for_in_flight(self):
         while True:
