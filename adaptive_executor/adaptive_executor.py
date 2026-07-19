@@ -73,6 +73,11 @@ class PendingWork:
     # 10ms dispatch tick does not re-copy the profile under lock every cycle).
     estimate_sample_count: int = 0
     estimate_refreshed_at: float | None = None
+    # The profile's memory floor the current estimate was computed under. A crash
+    # floor is recorded WITHOUT adding an observation, so re-estimation must also
+    # compare floors — otherwise queued siblings keep their too-small estimates
+    # and repeat the very crash the floor exists to prevent.
+    estimate_floor_gb: float | None = None
     # Cold-start canary identity: the ProfileStore key estimation actually drew
     # from this cycle, stamped in ``_build_dispatch_plan`` and carried into
     # ``in_flight`` so a running canary's identity is known to the scheduler.
@@ -267,6 +272,7 @@ class AdaptiveExecutor:
             vram_hint=vram_gb,
             estimate_sample_count=profile.sample_count,
             estimate_refreshed_at=now,
+            estimate_floor_gb=profile.memory_floor_gb,
         )
 
         with self.lock:
@@ -367,7 +373,10 @@ class AdaptiveExecutor:
                 pending.item.fn_module, pending.item.fn_name, pending.profile_key
             )
             pending.estimate_refreshed_at = now
-            if profile.sample_count == pending.estimate_sample_count:
+            if (
+                profile.sample_count == pending.estimate_sample_count
+                and profile.memory_floor_gb == pending.estimate_floor_gb
+            ):
                 continue
             new_estimate = profile.estimate(
                 memory_hint=pending.memory_hint, vram_hint=pending.vram_hint
@@ -388,6 +397,7 @@ class AdaptiveExecutor:
                 )
             pending.estimate = new_estimate
             pending.estimate_sample_count = profile.sample_count
+            pending.estimate_floor_gb = profile.memory_floor_gb
 
     def _infeasible_estimate(
         self,

@@ -255,3 +255,24 @@ def test_different_functions_each_get_their_own_canary():
     ex._maybe_dispatch()
     # Distinct identities -> both canaries admit.
     assert len(ex.in_flight) == 2
+
+
+def test_floor_change_triggers_reestimation_without_new_samples():
+    # A crash floor is recorded WITHOUT adding an observation (the worker died
+    # before reporting). Queued siblings must still pick the floor up on the
+    # next re-estimation pass — comparing sample_count alone would leave them
+    # at the too-small estimate and repeat the very crash the floor prevents.
+    ex = _make_executor(snapshot=_snapshot(memory_total_gb=100.0))
+    ex.submit(task_fns.echo, 1)
+    pending = ex.pending[0]
+    original_mem = pending.estimate.memory_gb
+
+    # Sibling crashed: floor recorded, sample_count unchanged (no observation).
+    ex.profiles.record_memory_floor("task_fns", "echo", 30.0)
+
+    ex._reestimate_pending(pending.estimate_refreshed_at + 1.0)
+
+    assert pending.estimate.memory_gb == 30.0
+    assert pending.estimate.memory_gb > original_mem
+    assert pending.estimate_floor_gb == 30.0
+    assert pending.estimate_sample_count == 0
