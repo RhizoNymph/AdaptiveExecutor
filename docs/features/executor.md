@@ -119,29 +119,67 @@
      stuffing an exception into a cancelled future).
 3. **worker** (subprocess): resolves fn via shared `resolve_function`, runs it,
    samples RSS and (only when pinned) pinned-GPU VRAM, returns a `WorkResult`.
-4. **_collect_results** (thread): clears the worker's `current_work_id`,
-   increments `tasks_completed`, recycles the worker if it hit
+4. **_collect_results** (thread): **per-worker result queues.** Each worker owns
+   its own result queue (`WorkerSlot.result_queue`, created in `_spawn_worker`
+   and passed to `worker_process_entry`); there is deliberately no shared result
+   queue. The collector loops `_sweep_result_queues()`, which snapshots
+   `self.workers` under the lock and non-blocking-drains each live worker's queue
+   via `_read_queue` (`get_nowait()` until `Empty`), sleeping 10ms only when a
+   sweep found nothing. A *poisoned* queue (its worker was intentionally killed
+   and may have corrupted its own feeder state) is never read. Each collected
+   `WorkResult` goes through the unchanged `_process_result`: clears the worker's
+   `current_work_id`, increments `tasks_completed`, recycles the worker if it hit
    `worker_recycle_after_tasks`, pops `in_flight`, records the observation
    (`ProfileStore.record(module, qualname, obs, profile_key=pending.profile_key)`,
    debounced persist — writes both the base and, when a key was carried, the
    keyed profile), and resolves the future.
-5. **_check_timeouts** (thread): fails or kills workers for tasks exceeding
-   `task_timeout_seconds` per `on_timeout`.
+   - **Why per-worker queues.** With one shared `mp.Queue`, a SIGTERM/SIGKILL
+     landing while any worker was mid-`put` was a documented hazard: the queue's
+     shared feeder state could be left wedged, silently breaking result delivery
+     for *every* worker thereafter. Per-worker queues bound the blast radius of
+     killing a worker to that worker's own queue.
+   - **Queue lifecycle (drain vs. discard).** `_drain_queue(slot)` processes any
+     final results a *gracefully exited* worker left behind (only safe after the
+     process has exited, so `get_nowait()` reaches `Empty` and cannot block);
+     `_discard_queue(slot)` closes the queue and cancels its join thread
+     (idempotent via `queue_discarded`) so a discard can never block the parent
+     on GC/exit. A poisoned queue is discarded but **never** drained.
+5. **_check_timeouts** / **_handle_timeout** (thread): fails or kills workers for
+   tasks exceeding `task_timeout_seconds` per `on_timeout`.
+   - `on_timeout="kill_worker"`: under the lock the worker is marked
+     `intentionally_stopped` + `queue_poisoned`, its `current_work_id` cleared,
+     removed from `self.workers` and parked in `self._retiring`, and the task
+     popped from `in_flight`. Poisoning under the lock guarantees the collector
+     never reads that queue again. Outside the lock, `_escalate_kill` sends
+     `terminate()` (SIGTERM), waits `_kill_grace_seconds` (0.5s), and escalates to
+     `kill()` (SIGKILL) if the worker is still alive (the worker installs no
+     SIGTERM handler, so default SIGTERM normally kills it immediately). The
+     task's future is failed with `TimeoutError`. `_check_workers` later reaps
+     the retired worker: join + `_discard_queue` (poisoned ⇒ no drain).
+   - `on_timeout="fail_future"`: unchanged — mark `result_ignored`, pop
+     `in_flight`, clear the worker's `current_work_id`, fail the future.
 6. **shutdown**: stops accepting, fails queued futures, drains in-flight, stops
-   all workers (including `_retiring`), joins threads, `profiles.flush()`,
-   stops the monitor.
+   all workers (including `_retiring`) — `_stop_all_workers` sends the stop
+   sentinel, joins, then **drains** each non-poisoned worker's queue (so a final
+   in-flight result is still delivered) and **discards** every queue — joins
+   threads, `profiles.flush()`, stops the monitor.
 
 ## Files and roles
 - `adaptive_executor/adaptive_executor.py` — `AdaptiveExecutor`, `WorkerSlot`
-  (adds `tasks_completed`), `PendingWork` (carries the optional `profile_key`
-  parent-side from submit through `_process_result`; workers never see it). Key
-  methods:
+  (adds `tasks_completed`, and for kill isolation: `result_queue` (per-worker),
+  `queue_poisoned`, `queue_discarded`), `PendingWork` (carries the optional
+  `profile_key` parent-side from submit through `_process_result`; workers never
+  see it). Key methods:
   `_get_or_spawn_idle_worker`, `_find_idle_evictable_worker`, `_retire_worker`,
-  `_should_recycle`, `_check_workers` (reaps `_retiring`), `_maybe_dispatch`,
+  `_should_recycle`, `_check_workers` (reaps `_retiring`, drain-then-discard each
+  reaped queue), `_handle_dead_worker` (drain-then-discard a crashed worker's
+  queue before crash handling), `_maybe_dispatch`,
   `_infeasible_estimate`, `_build_dispatch_plan`, `_running_remaining_seconds`,
   `_committed_resources`, `_committed_vram_per_gpu`, `_capture_baseline`,
   `_refresh_observations`, `_update_observed`, `_sample_rss_bytes`,
   `_sample_process_vram_gb`, `_worker_process_pids`, `_collect_results`,
+  `_sweep_result_queues`, `_read_queue`, `_drain_queue`, `_discard_queue`,
+  `_handle_timeout`, `_escalate_kill`, `_stop_all_workers`,
   `_settle_future_result`, `_settle_future_exception` (cancellation-safe future
   settling). `PendingWork` also carries `running_notified` (the once-only
   running-handshake flag).
@@ -183,6 +221,16 @@
   running and moves on to the next pending task.
 - A `WorkerSlot` in `self.workers` is alive or about to be reaped by
   `_check_workers`; retired workers live only in `self._retiring` until joined.
+- **Result-queue isolation.** Each `WorkerSlot` owns its `result_queue`
+  (production always populates it in `_spawn_worker`; the `None` default exists
+  only so test fakes may omit it). The collector reads a worker's queue only
+  while the worker is live and non-poisoned. A queue is drained (final results
+  processed) exactly once, at reap, and only for a gracefully-exited or crashed
+  worker whose process has already exited; a poisoned (intentionally-killed)
+  queue is discarded without ever being read. `_discard_queue` is idempotent
+  (`queue_discarded`) and always closes + cancels the join thread, so a discard
+  never blocks the parent. Consequence: killing one worker can corrupt at most
+  its own queue, never result delivery for any other worker.
 - Workers are pinned to one GPU (NVML index) for their lifetime; a pin change
   requires evicting the worker and spawning a replacement.
 - Committed resources always cover in-flight tasks; admission uses

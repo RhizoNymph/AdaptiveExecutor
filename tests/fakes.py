@@ -4,6 +4,7 @@ No test touches real NVML or launches real GPU work; the machine has no GPU.
 """
 
 import types
+from queue import Empty
 
 
 class FakeProcess:
@@ -15,6 +16,10 @@ class FakeProcess:
         self.exitcode = None
         self.join_timeouts: list[float | None] = []
         self.terminated = False
+        self.killed = False
+        # When set, ``terminate()`` does NOT flip liveness (models a worker that
+        # ignores SIGTERM), so the escalation path must call ``kill()``.
+        self.ignore_terminate = False
 
     def is_alive(self) -> bool:
         return self._alive
@@ -24,8 +29,15 @@ class FakeProcess:
 
     def terminate(self):
         self.terminated = True
+        if self.ignore_terminate:
+            return
         self._alive = False
         self.exitcode = -15
+
+    def kill(self):
+        self.killed = True
+        self._alive = False
+        self.exitcode = -9
 
     def set_dead(self, exitcode: int = 0):
         self._alive = False
@@ -33,16 +45,35 @@ class FakeProcess:
 
 
 class FakeQueue:
-    """Stand-in for mp.Queue that records puts."""
+    """Stand-in for mp.Queue that records puts and supports non-blocking gets.
+
+    ``put`` appends to ``items``; ``get_nowait`` pops FIFO and raises
+    ``queue.Empty`` when drained, mirroring ``mp.Queue``. ``close`` /
+    ``cancel_join_thread`` are recorded no-ops so queue-discard bookkeeping can
+    be asserted.
+    """
 
     def __init__(self):
         self.items: list = []
+        self.closed = False
+        self.cancel_join_thread_called = False
 
     def put(self, item):
         self.items.append(item)
 
     def get(self, timeout=None):
         raise NotImplementedError
+
+    def get_nowait(self):
+        if not self.items:
+            raise Empty
+        return self.items.pop(0)
+
+    def close(self):
+        self.closed = True
+
+    def cancel_join_thread(self):
+        self.cancel_join_thread_called = True
 
 
 class FakeMonitor:
