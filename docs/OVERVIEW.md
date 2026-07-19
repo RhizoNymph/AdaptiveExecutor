@@ -38,7 +38,14 @@ Overview:
       module: adaptive_executor/profiles.py
       role: >
         LearnedProfile (p90 estimates + safety margin) and ProfileStore
-        (thread-safe, debounced JSON persistence).
+        (thread-safe, debounced JSON persistence). Profiles are keyed by a
+        derived store key from the pure ``derive_store_key(module, qualname,
+        profile_key=None)`` — the base profile at ``module:qualname`` and,
+        when a caller supplies an opaque ``profile_key``, an input-bucketed
+        profile at ``module:qualname#profile_key``. Every observation is
+        recorded into both the base and (when given) the keyed profile;
+        estimation prefers the keyed profile once it has any observation and
+        otherwise falls back to the base aggregate.
     resolve:
       module: adaptive_executor/resolve.py
       role: >
@@ -64,9 +71,9 @@ Overview:
         invariants over a recorded virtual-time trace. See
         docs/features/scheduler-sim.md.
   data_flow: >
-    submit() validates the callable is importable, looks up its LearnedProfile,
-    and computes a ResourceEstimate (p90 memory/VRAM/CPU plus a p90 run
-    duration). It then checks feasibility against known capacity (total minus
+    submit() validates the callable is importable, looks up its LearnedProfile
+    (the input-bucketed one when a profile_key is passed, else the base), and
+    computes a ResourceEstimate (p90 memory/VRAM/CPU plus a p90 run duration). It then checks feasibility against known capacity (total minus
     headroom) and raises InfeasibleTaskError synchronously if the estimate can
     never fit, so an impossible task fails at the call site instead of silently
     queuing forever. A background dispatch thread first re-checks feasibility
@@ -84,7 +91,8 @@ Overview:
     necessary) and sends the WorkItem over that worker's queue. The worker
     executes, measures usage, and returns a WorkResult on the shared result
     queue. A result thread resolves the future and records the
-    ResourceObservation (including duration_seconds) into the ProfileStore,
+    ResourceObservation (including duration_seconds) into the ProfileStore under
+    both the base and (when the task carried a profile_key) the keyed profile,
     which persists to disk in a debounced fashion. Workers are recycled after a
     configurable number of tasks and reaped without leaving zombies.
 

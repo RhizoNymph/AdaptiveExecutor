@@ -1,7 +1,8 @@
 # Feature: Adaptive Executor
 
 ## Scope
-- Public API: `AdaptiveExecutor.submit`, `start`, `shutdown`, context-manager use.
+- Public API: `AdaptiveExecutor.submit` (incl. optional `profile_key` input
+  bucketing), `start`, `shutdown`, context-manager use.
 - Submit-time validation of callable importability.
 - Admission control from learned profiles + live resource snapshots.
 - Worker-pool lifecycle: spawn, reuse (by pin), evict-and-replace on pin
@@ -18,13 +19,19 @@
 - Backwards-compatibility shims for prior persistence formats.
 
 ## Data / control flow
-1. **submit(fn, *args, memory_gb=, vram_gb=, **kwargs)**
+1. **submit(fn, *args, memory_gb=, vram_gb=, profile_key=, **kwargs)**
    - `validate_submittable(fn)` rejects lambdas/closures (`<locals>` in
      qualname), unimportable callables, and objects that re-resolve to something
      other than `fn` (e.g. bound methods) with a clear `ValueError`.
    - Builds a `WorkItem(module, qualname, args, kwargs)`.
-   - `ProfileStore.get` returns a snapshot `LearnedProfile`; `estimate()` yields a
-     `ResourceEstimate` (p90 + confidence-scaled safety margin, or hints).
+   - `ProfileStore.get(module, qualname, profile_key)` returns a snapshot
+     `LearnedProfile`: with a `profile_key` it returns the input-bucketed
+     profile once that bucket has at least one observation, else the base
+     profile (fallback). `estimate()` yields a `ResourceEstimate` (p90 +
+     confidence-scaled safety margin, or hints). The `profile_key` is an opaque
+     caller-chosen string used to bucket inputs whose resource usage differs
+     (e.g. "small"/"large", a file-size band); it is stored on the `PendingWork`
+     so result-side recording writes back to the same bucket.
    - `_infeasible_estimate(estimate, snapshot, retry_count=0)` against a snapshot
      (`monitor.current` or a direct `monitor.snapshot()` if not yet populated):
      if the estimate exceeds total capacity minus headroom (`memory_gb >
@@ -69,7 +76,9 @@
 4. **_collect_results** (thread): clears the worker's `current_work_id`,
    increments `tasks_completed`, recycles the worker if it hit
    `worker_recycle_after_tasks`, pops `in_flight`, records the observation
-   (`ProfileStore.record`, debounced persist), and resolves the future.
+   (`ProfileStore.record(module, qualname, obs, profile_key=pending.profile_key)`,
+   debounced persist — writes both the base and, when a key was carried, the
+   keyed profile), and resolves the future.
 5. **_check_timeouts** (thread): fails or kills workers for tasks exceeding
    `task_timeout_seconds` per `on_timeout`.
 6. **shutdown**: stops accepting, fails queued futures, drains in-flight, stops
@@ -78,7 +87,9 @@
 
 ## Files and roles
 - `adaptive_executor/adaptive_executor.py` — `AdaptiveExecutor`, `WorkerSlot`
-  (adds `tasks_completed`), `PendingWork`. Key methods:
+  (adds `tasks_completed`), `PendingWork` (carries the optional `profile_key`
+  parent-side from submit through `_process_result`; workers never see it). Key
+  methods:
   `_get_or_spawn_idle_worker`, `_find_idle_evictable_worker`, `_retire_worker`,
   `_should_recycle`, `_check_workers` (reaps `_retiring`), `_maybe_dispatch`,
   `_infeasible_estimate`, `_build_dispatch_plan`, `_running_remaining_seconds`,
@@ -93,8 +104,12 @@
 - `adaptive_executor/monitor.py` — `ResourceMonitor`. Key exports:
   `snapshot`, `current`, `device_vram_used_gb`, `per_process_vram_gb`,
   `_compute_running_processes` (v3/v2/unversioned fallback).
-- `adaptive_executor/profiles.py` — `LearnedProfile`, `ProfileStore`. Key:
-  `record`, `flush`, `_should_save_locked`, `_snapshot_locked`,
+- `adaptive_executor/profiles.py` — `LearnedProfile`, `ProfileStore`, and the
+  pure `derive_store_key(module, qualname, profile_key=None)` (the single place
+  store keys are built: base `module:qualname`, keyed
+  `module:qualname#profile_key`, `STORE_KEY_SEPARATOR = "#"`). Key methods:
+  `get` / `_select_profile_locked` (keyed-with-fallback selection), `record`
+  (dual base+keyed write), `flush`, `_should_save_locked`, `_snapshot_locked`,
   `_persist_snapshot`, `_write_atomic`, `_load`.
 - `adaptive_executor/resolve.py` — `resolve_function`, `validate_submittable`,
   `FunctionResolutionError`.
@@ -122,5 +137,14 @@
 - Persistence is debounced (`save_every_n` observations or
   `save_interval_seconds`); serialization happens under the store lock, file I/O
   outside it under a separate save lock; `flush()` (and `shutdown`) force a save.
+- Input-aware profiles: every observation is recorded into the base profile
+  (`module:qualname`), so the base is always the full aggregate and remains a
+  valid fallback; the keyed profile (`module:qualname#profile_key`) is written
+  only when a `profile_key` was supplied. Estimation uses the keyed profile only
+  when it has ≥1 observation, else the base — and the fallback read never
+  materializes an empty keyed entry. Store keys are strings, so keyed profiles
+  persist and reload with no special handling. The submit/dispatch feasibility
+  checks operate on whatever `profile.estimate()` returns, so choosing the keyed
+  profile before estimating is all that makes them input-aware.
 - Profile save/load failures are logged (warning/error), never raised into the
   record path; a corrupt file yields an empty store, not a crash.
