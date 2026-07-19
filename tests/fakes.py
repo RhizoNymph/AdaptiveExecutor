@@ -9,8 +9,9 @@ import types
 class FakeProcess:
     """Stand-in for mp.Process with controllable liveness."""
 
-    def __init__(self, alive: bool = True):
+    def __init__(self, alive: bool = True, pid: int | None = None):
         self._alive = alive
+        self.pid = pid
         self.exitcode = None
         self.join_timeouts: list[float | None] = []
         self.terminated = False

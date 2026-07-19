@@ -24,6 +24,15 @@ Overview:
         the set of tasks to dispatch this cycle so that later tasks may backfill
         past a blocked head only when they cannot delay the head's reservation.
         No threads, no I/O, no executor state.
+    accounting:
+      module: adaptive_executor/accounting.py
+      role: >
+        Pure observed-usage commitment accounting. Committed resources are the
+        unrealized remainder max(estimate - observed, 0): a running task's
+        realized RAM/VRAM already appears in the live snapshot's used figure, so
+        crediting observed usage against the estimate avoids admission
+        double-counting. Single source of truth for both admission committed
+        totals/per-GPU maps and the reservation release projection.
     worker:
       module: adaptive_executor/worker.py
       role: >
@@ -73,9 +82,14 @@ Overview:
     across the pending queue (an estimate can become infeasible after
     crash-retry penalization doubles it) and sets InfeasibleTaskError on any
     such task's future without killing the thread. It then gathers live state
-    each cycle (monitor snapshot, committed in-flight estimates, per-GPU VRAM,
+    each cycle (monitor snapshot, committed in-flight resources, per-GPU VRAM,
     running tasks' elapsed-vs-expected times) into the scheduling subsystem's
-    input dataclasses and calls plan_dispatch(). The scheduler returns an
+    input dataclasses and calls plan_dispatch(). Committed resources credit each
+    running task's observed (already-realized) usage against its estimate
+    (max(estimate - observed, 0), via the accounting subsystem); observed usage
+    is sampled parent-side from the worker process's RSS and per-process VRAM
+    relative to a dispatch-time baseline, so a task that has already allocated
+    its memory no longer blocks admission a second time. The scheduler returns an
     ordered set of dispatch decisions (which pending tasks to start now and on
     which GPU): front tasks are admitted in strict FIFO order while they fit,
     and when the head is blocked, later tasks may backfill only if they cannot
@@ -103,6 +117,7 @@ Features Index:
       - profiles
       - resolve
       - backfill_scheduling
+      - accounting
       - errors
     doc: docs/features/executor.md
   backfill_scheduling:

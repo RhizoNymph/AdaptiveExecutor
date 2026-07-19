@@ -12,6 +12,14 @@ from dataclasses import dataclass, replace
 from queue import Empty
 from typing import Callable, Literal
 
+import psutil
+
+from .accounting import (
+    ResourceUsage,
+    committed_gb,
+    committed_vram_per_gpu,
+    total_committed_gb,
+)
 from .dtypes import ResourceEstimate, ResourceSnapshot, WorkItem, WorkResult
 from .errors import InfeasibleTaskError
 from .monitor import ResourceMonitor
@@ -40,6 +48,16 @@ class PendingWork:
     retry_count: int = 0
     exclusive: bool = False
     result_ignored: bool = False
+    # Observed-usage accounting (parent-side polling). Baselines are captured at
+    # dispatch; ``observed_*`` are the current attributable usage above baseline,
+    # refreshed at most once per ``_observation_refresh_seconds``. The full
+    # estimate stays committed until usage is realized (observed == 0 fallback).
+    worker_pid: int | None = None
+    rss_baseline_bytes: int | None = None
+    vram_baseline_gb: float | None = None
+    observed_memory_gb: float = 0.0
+    observed_vram_gb: float = 0.0
+    observed_refreshed_at: float | None = None
 
 
 @dataclass
@@ -85,6 +103,9 @@ class AdaptiveExecutor:
         self.worker_recycle_after_tasks = worker_recycle_after_tasks
         self._next_gpu_index = 0
         self._next_worker_id = 0
+        # Cache per-task observed-usage samples this long so psutil/NVML are not
+        # polled on every 10ms dispatch tick.
+        self._observation_refresh_seconds = 0.1
 
         # Time source and monitor are injectable seams so a deterministic
         # simulation can substitute a virtual clock and a synthetic monitor.
@@ -270,6 +291,7 @@ class AdaptiveExecutor:
                 pending.assigned_gpu_id = decision.gpu_id
                 pending.worker_id = worker.worker_id
                 pending.started_at = self._clock()
+                self._capture_baseline(pending, worker, decision.gpu_id)
                 self.in_flight[pending.item.id] = pending
                 worker.current_work_id = pending.item.id
                 worker.work_queue.put(replace(pending.item, gpu_id=decision.gpu_id))
@@ -326,6 +348,9 @@ class AdaptiveExecutor:
         """
         snapshot = self.monitor.current
         now = self._clock()
+        # Refresh observed usage first so committed totals credit realized
+        # allocation (already reflected in ``snapshot``) against the estimates.
+        self._refresh_observations(now)
         committed = self._committed_resources()
         committed_vram = self._committed_vram_per_gpu()
         gpu_ids = self.gpu_ids or []
@@ -356,11 +381,15 @@ class AdaptiveExecutor:
                 )
             snapshot_present = True
 
+        # A running task releases only its committed remainder to the live pool
+        # when it finishes; see ``_running_release_gb`` for the conservative
+        # rationale. Using the remainder keeps the head's reservation from ever
+        # assuming more frees than the accounting guarantees.
         running = [
             RunningEntry(
                 id=p.item.id,
-                memory_gb=p.estimate.memory_gb,
-                vram_gb=p.estimate.vram_gb,
+                memory_gb=committed_gb(p.estimate.memory_gb, p.observed_memory_gb),
+                vram_gb=committed_gb(p.estimate.vram_gb, p.observed_vram_gb),
                 gpu_id=p.assigned_gpu_id,
                 remaining_seconds=self._running_remaining_seconds(p, now),
             )
@@ -408,18 +437,139 @@ class AdaptiveExecutor:
         return expected - elapsed
 
     def _committed_resources(self) -> ResourceEstimate:
+        """In-flight resources still awaiting realization.
+
+        Memory/VRAM commit only the unrealized remainder
+        ``max(estimate - observed, 0)`` because realized usage already shows up in
+        the monitor snapshot's ``used`` figure (avoiding admission double-counting).
+        CPU cores carry no observed credit — they gate worker-slot pressure, not
+        snapshot memory — so they remain the sum of estimates.
+        """
         return ResourceEstimate(
-            memory_gb=sum(p.estimate.memory_gb for p in self.in_flight.values()),
-            vram_gb=sum(p.estimate.vram_gb for p in self.in_flight.values()),
+            memory_gb=total_committed_gb(
+                (p.estimate.memory_gb, p.observed_memory_gb)
+                for p in self.in_flight.values()
+            ),
+            vram_gb=total_committed_gb(
+                (p.estimate.vram_gb, p.observed_vram_gb)
+                for p in self.in_flight.values()
+            ),
             cpu_cores=sum(p.estimate.cpu_cores for p in self.in_flight.values()),
         )
 
     def _committed_vram_per_gpu(self) -> dict[int, float]:
-        committed: dict[int, float] = {}
+        return committed_vram_per_gpu(
+            ResourceUsage(
+                gpu_id=p.assigned_gpu_id,
+                estimate_gb=p.estimate.vram_gb,
+                observed_gb=p.observed_vram_gb,
+            )
+            for p in self.in_flight.values()
+        )
+
+    # -- observed-usage polling (parent-side, no worker protocol changes) -----
+
+    def _capture_baseline(
+        self, pending: PendingWork, worker: WorkerSlot, gpu_id: int | None
+    ) -> None:
+        """Record the assigned worker's RSS (and pinned-GPU VRAM) baseline at
+        dispatch. Observed usage is measured as growth above this baseline. If the
+        worker pid is unknown or unreadable, baselines stay ``None`` and observed
+        usage stays 0 (the full estimate remains committed — conservative).
+        """
+        pid = getattr(worker.process, "pid", None)
+        pending.worker_pid = pid
+        pending.observed_memory_gb = 0.0
+        pending.observed_vram_gb = 0.0
+        pending.observed_refreshed_at = self._clock()
+        if pid is None:
+            pending.rss_baseline_bytes = None
+            pending.vram_baseline_gb = None
+            return
+        pending.rss_baseline_bytes = self._sample_rss_bytes(pid)
+        pending.vram_baseline_gb = (
+            self._sample_process_vram_gb(pid, gpu_id) if gpu_id is not None else None
+        )
+
+    def _refresh_observations(self, now: float) -> None:
+        """Refresh each in-flight task's observed usage, throttled to at most once
+        per ``_observation_refresh_seconds`` so psutil/NVML are not hammered on the
+        10ms dispatch tick. Must be called while holding ``self.lock``.
+        """
         for pending in self.in_flight.values():
-            if pending.assigned_gpu_id is not None:
-                committed[pending.assigned_gpu_id] = committed.get(pending.assigned_gpu_id, 0.0) + pending.estimate.vram_gb
-        return committed
+            last = pending.observed_refreshed_at
+            if last is not None and (now - last) < self._observation_refresh_seconds:
+                continue
+            self._update_observed(pending, now)
+
+    def _update_observed(self, pending: PendingWork, now: float) -> None:
+        pending.observed_refreshed_at = now
+        pid = pending.worker_pid
+        if pid is None:
+            return
+
+        if pending.rss_baseline_bytes is not None:
+            current = self._sample_rss_bytes(pid)
+            pending.observed_memory_gb = (
+                max(0.0, (current - pending.rss_baseline_bytes) / 1e9)
+                if current is not None
+                else 0.0
+            )
+
+        if pending.assigned_gpu_id is not None and pending.vram_baseline_gb is not None:
+            current_vram = self._sample_process_vram_gb(pid, pending.assigned_gpu_id)
+            pending.observed_vram_gb = (
+                max(0.0, current_vram - pending.vram_baseline_gb)
+                if current_vram is not None
+                else 0.0
+            )
+
+        logger.debug(
+            "observed usage work_id=%s est_mem_gb=%.3f obs_mem_gb=%.3f "
+            "est_vram_gb=%.3f obs_vram_gb=%.3f",
+            pending.item.id,
+            pending.estimate.memory_gb,
+            pending.observed_memory_gb,
+            pending.estimate.vram_gb,
+            pending.observed_vram_gb,
+        )
+
+    def _sample_rss_bytes(self, pid: int) -> int | None:
+        """Current RSS (bytes) of ``pid``, or None if the process is unreadable.
+
+        Overridable seam. Narrow, typed excepts only; polling failures never
+        propagate into the dispatch thread.
+        """
+        try:
+            return psutil.Process(pid).memory_info().rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as exc:
+            logger.debug("rss sample failed pid=%d error=%r", pid, exc)
+            return None
+
+    def _worker_process_pids(self, pid: int) -> set[int]:
+        """``pid`` plus its descendant pids, for per-process VRAM attribution."""
+        pids = {pid}
+        try:
+            for child in psutil.Process(pid).children(recursive=True):
+                pids.add(child.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as exc:
+            logger.debug("child pid enumeration failed pid=%d error=%r", pid, exc)
+        return pids
+
+    def _sample_process_vram_gb(self, pid: int, gpu_id: int | None) -> float | None:
+        """VRAM (GB) attributable to ``pid``'s process tree on ``gpu_id``.
+
+        Returns None when the monitor cannot supply per-process VRAM (no NVML,
+        unavailable API), so callers keep the full estimate committed. Overridable
+        seam.
+        """
+        if gpu_id is None:
+            return None
+        per_process = getattr(self.monitor, "per_process_vram_gb", None)
+        if per_process is None:
+            return None
+        pids = self._worker_process_pids(pid)
+        return per_process(gpu_id, pids)
 
     def _get_or_spawn_idle_worker(self, pinned_gpu_id: int | None) -> WorkerSlot | None:
         for worker in self.workers.values():
@@ -646,6 +796,13 @@ class AdaptiveExecutor:
                 lost_pending.worker_id = None
                 lost_pending.started_at = None
                 lost_pending.result_ignored = False
+                # Re-baseline observed usage on the next dispatch of this retry.
+                lost_pending.worker_pid = None
+                lost_pending.rss_baseline_bytes = None
+                lost_pending.vram_baseline_gb = None
+                lost_pending.observed_memory_gb = 0.0
+                lost_pending.observed_vram_gb = 0.0
+                lost_pending.observed_refreshed_at = None
                 self.pending.appendleft(lost_pending)
             return
 

@@ -44,10 +44,11 @@
      it must fail instead.
    - `_maybe_dispatch()` then gathers live state via `_build_dispatch_plan()`
      and calls the pure `scheduling.plan_dispatch()` (reservation-based
-     backfill). `_build_dispatch_plan()` computes admittable memory (snapshot
-     memory minus used, headroom, and committed in-flight estimates), per-GPU
-     admittable VRAM (via `_committed_vram_per_gpu`), and each running task's
-     remaining time (via `_running_remaining_seconds`, from
+     backfill). `_build_dispatch_plan()` first calls `_refresh_observations()`
+     (see **Observed-usage accounting** below), then computes admittable memory
+     (snapshot memory minus used, headroom, and *committed* in-flight
+     resources), per-GPU admittable VRAM (via `_committed_vram_per_gpu`), and
+     each running task's remaining time (via `_running_remaining_seconds`, from
      `duration_p90_seconds` vs elapsed, using the injected clock). When no
      monitor snapshot exists yet, memory/VRAM are treated as infinite
      (non-gating). The scheduler returns an ordered list of `DispatchDecision`
@@ -56,6 +57,28 @@
      arithmetic (memory headroom against committed estimates, cpu-cores derived
      effective max, per-GPU round-robin VRAM fit) now lives inside the pure
      scheduler.
+   - **Observed-usage accounting (avoids admission double-counting).** A running
+     task's realized RAM/VRAM already appears in `snapshot.used`; counting its
+     full estimate on top of that double-counts and under-utilizes the machine.
+     So committed resources credit observed usage: `committed_i =
+     max(estimate_i - observed_i, 0)` (pure helpers in
+     `adaptive_executor/accounting.py`). `observed_i` is measured **parent-side**
+     with no worker-protocol changes: `_capture_baseline` samples the assigned
+     worker process's RSS (and pinned-GPU per-process VRAM) at dispatch;
+     `_refresh_observations` re-samples at most once per
+     `_observation_refresh_seconds` (0.1s) and sets `observed = max(0, current -
+     baseline)`. If the process is unreadable (exited/permission) or NVML is
+     unavailable, observed falls back to 0 so the full estimate stays committed
+     (conservative). Sampling uses narrow, typed excepts
+     (`psutil.NoSuchProcess/AccessDenied/ZombieProcess`, NVML errors handled in
+     the monitor) and never propagates into the dispatch thread. The sampling
+     seams `_sample_rss_bytes` / `_sample_process_vram_gb` are overridable for
+     tests. **Reservation release projection:** each `RunningEntry` is fed its
+     committed remainder `max(estimate - observed, 0)` as the amount it releases
+     when it finishes — *not* the full estimate. The realized portion already
+     sits in `snapshot.used` and is deliberately NOT assumed to return, so the
+     head's reservation never assumes more frees than the accounting guarantees
+     (under-promise = safe, degrades toward FIFO).
    - `_get_or_spawn_idle_worker(gpu_id)`:
      - reuse an alive idle worker with matching pin; else
      - if below cap, spawn a worker pinned to `gpu_id`; else
@@ -82,7 +105,17 @@
   `_get_or_spawn_idle_worker`, `_find_idle_evictable_worker`, `_retire_worker`,
   `_should_recycle`, `_check_workers` (reaps `_retiring`), `_maybe_dispatch`,
   `_infeasible_estimate`, `_build_dispatch_plan`, `_running_remaining_seconds`,
-  `_committed_resources`, `_committed_vram_per_gpu`, `_collect_results`.
+  `_committed_resources`, `_committed_vram_per_gpu`, `_capture_baseline`,
+  `_refresh_observations`, `_update_observed`, `_sample_rss_bytes`,
+  `_sample_process_vram_gb`, `_worker_process_pids`, `_collect_results`.
+  `PendingWork` also carries observed-usage fields (`worker_pid`,
+  `rss_baseline_bytes`, `vram_baseline_gb`, `observed_memory_gb`,
+  `observed_vram_gb`, `observed_refreshed_at`).
+- `adaptive_executor/accounting.py` — pure observed-usage commitment accounting:
+  `committed_gb(estimate, observed) = max(estimate - observed, 0)`,
+  `total_committed_gb`, `committed_vram_per_gpu`, `ResourceUsage`. Single source
+  of truth for both admission committed totals and the reservation release
+  projection. Unit-tested in `tests/test_accounting.py`.
 - `adaptive_executor/scheduling.py` — pure reservation-based backfill scheduler
   (`plan_dispatch`); see `docs/features/backfill-scheduling.md`.
 - `adaptive_executor/errors.py` — `InfeasibleTaskError` (structured fields:
@@ -111,8 +144,19 @@
   `_check_workers`; retired workers live only in `self._retiring` until joined.
 - Workers are pinned to one GPU (NVML index) for their lifetime; a pin change
   requires evicting the worker and spawning a replacement.
-- Committed estimates always cover in-flight tasks; admission uses
-  committed + new estimate against available resources minus headroom.
+- Committed resources always cover in-flight tasks; admission uses
+  committed + new estimate against available resources minus headroom. Committed
+  credits observed (realized) usage — `committed = max(estimate - observed, 0)`
+  — so an allocation that already shows in `snapshot.used` is not counted twice.
+  Committed is monotone in observed only downward: it can never exceed the
+  estimate, so the headroom invariant is preserved (observed credit only ever
+  frees admission capacity, never grants more than the estimate reserved).
+- Observed usage is measured parent-side (RSS + per-process VRAM) relative to a
+  dispatch-time baseline, cached per `_observation_refresh_seconds`, and falls
+  back to 0 (full estimate committed) whenever the worker process or NVML is
+  unreadable. A finishing task is projected to release only its committed
+  remainder to the reservation (never the already-realized portion), keeping the
+  head's reservation conservative.
 - Only an idle worker (`current_work_id is None`, alive, not
   `intentionally_stopped`) may be reused, evicted, or recycled.
 - VRAM is attributed to the worker's pinned device only; an unpinned worker
